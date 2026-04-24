@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+.env
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Run artifacts (regenerate with scripts)
+outputs/
+snn_ssl_wisdm/processed/*.pt
+logs/*.out
+logs/*.err
+
+# Optional: large local experiment dirs (uncomment if you do not want raw data on GitHub)
+# wisdm-dataset/raw/

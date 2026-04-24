@@ -1,0 +1,39 @@
+seed: 42
+device: null
+dataset_root: wisdm-dataset
+device_type: watch
+sensor: accel
+sample_rate: 20
+resample_rate: null
+window_seconds: 10
+stride_seconds: 5
+num_classes: 18
+batch_size: 128
+num_workers: 4
+epochs_linear_probe: 50
+epochs_pretrain: 100
+lr_head: 0.001
+lr_pretrain: 0.001
+weight_decay: 0.0001
+patience: 10
+grad_clip: 1.0
+amp: true
+limit_subjects: null
+max_windows: null
+epochs: null
+processed_path: snn_ssl_wisdm/processed/wisdm_watch_accel_10s.pt
+splits_path: snn_ssl_wisdm/processed/splits_seed42.json
+spiking:
+  timesteps: 4
+  beta: 0.5
+  threshold: 1.0
+  detach_reset: true
+model:
+  base_channels: 64
+  layers: [2, 2, 2, 2]
+  feature_dim: 512
+  in_channels: 3
+output_root: outputs
+augpred:
+  num_perm_chunks: 4
+  time_warp_strength: 0.15

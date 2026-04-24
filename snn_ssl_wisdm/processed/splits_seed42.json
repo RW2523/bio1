@@ -1,0 +1,21 @@
+{
+  "split": {
+    "train": [
+      1623,
+      1619
+    ],
+    "val": [
+      1625
+    ],
+    "test": [
+      1611
+    ]
+  },
+  "meta": {
+    "seed": 42,
+    "train_ratio": 0.7,
+    "val_ratio": 0.1,
+    "test_ratio": 0.2,
+    "processed_path": "/Users/richardwatsonstephenamudha/Documents/new_b/snn_ssl_wisdm/processed/wisdm_watch_accel_10s.pt"
+  }
+}

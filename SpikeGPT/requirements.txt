@@ -1,0 +1,10 @@
+torch
+matplotlib
+numpy
+tqdm
+torchvision
+scipy
+ninja
+accelerate
+transformers
+datasets
