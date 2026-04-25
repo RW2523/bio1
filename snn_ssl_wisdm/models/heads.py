@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -18,20 +20,32 @@ class LinearClassifierHead(nn.Module):
 
 
 class MLPClassifierHead(nn.Module):
-    """Two-layer MLP head — used for Case 3 fine-tuning.
+    """Deeper MLP classifier for Case 3 (frozen backbone + non-linear probe).
 
-    Architecture: Linear → BN → ReLU → Dropout → Linear
-    Provides more capacity for end-to-end fine-tuning.
+    Uses LayerNorm instead of BatchNorm so small tail batches and probe-only
+    training remain stable. Two hidden stages by default (in → h1 → h2 → classes).
     """
 
-    def __init__(self, in_dim: int, num_classes: int, hidden_dim: int = 256, dropout: float = 0.3):
+    def __init__(
+        self,
+        in_dim: int,
+        num_classes: int,
+        hidden_dim: int = 512,
+        hidden_dim2: Optional[int] = None,
+        dropout: float = 0.2,
+    ):
         super().__init__()
+        h2 = hidden_dim2 if hidden_dim2 is not None else max(128, hidden_dim // 2)
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim, bias=False),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Linear(hidden_dim, h2),
+            nn.LayerNorm(h2),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(h2, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

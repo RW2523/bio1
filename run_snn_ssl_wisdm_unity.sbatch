@@ -11,7 +11,7 @@
 #   Step 2  Case 1            — random-init   frozen backbone + linear probe
 #   Step 3  AugPred pretrain  — 4-task SSL (rotation/AoT/time-warp/scale)
 #   Step 4  Case 2            — SSL-pretrained frozen backbone + linear probe
-#   Step 5  Case 3            — SSL-pretrained UNFROZEN + MLP fine-tune (≥60 %)
+#   Step 5  Case 3            — SSL-pretrained frozen backbone + MLP head (non-linear probe)
 #   Step 6  evaluate + plots
 #   Step 7  final comparison table
 # =============================================================================
@@ -48,7 +48,7 @@ echo ""
 echo "3-case SNN+SSL+WISDM pipeline"
 echo "  Case 1 : random-init frozen ResNet  + linear probe    (baseline)"
 echo "  Case 2 : AugPred SSL-pretrained frozen + linear probe (SSL benefit)"
-echo "  Case 3 : AugPred SSL-pretrained UNFROZEN + MLP head   (target >= 60 %)"
+echo "  Case 3 : AugPred SSL-pretrained frozen + MLP head (train head only)"
 echo ""
 echo "SNN config: beta=0.5 (tau=2), threshold=0.5 → ~16-27% neuron firing rate"
 echo "============================================================"
@@ -178,9 +178,9 @@ echo "All required folders present."
 # --smoke flag from the CLI if you want a quick sanity check locally).
 # These match the values in snn_ssl_wisdm/configs/default.yaml.
 # =============================================================================
-EP_P=200    # epochs_pretrain  (AugPred SSL)
-EP_L=100    # epochs_linear_probe (Cases 1 & 2)
-EP_F=100    # epochs_finetune     (Case 3)
+EP_P=300    # epochs_pretrain  (AugPred SSL; matches default.yaml)
+EP_L=150    # epochs_linear_probe (Cases 1 & 2)
+EP_F=150    # epochs_case3_mlp  (Case 3: frozen backbone + MLP head)
 PRETRAINED="outputs/augpred_pretrain_snn/best_backbone.pt"
 
 # =============================================================================
@@ -232,13 +232,12 @@ python -m snn_ssl_wisdm.scripts.linear_probe_snn \
   --epochs     "$EP_L"
 
 # =============================================================================
-# Step 5 — Case 3: SSL-pretrained UNFROZEN backbone + MLP head (full fine-tune)
-#   Differential LRs: backbone 1e-4, MLP head 1e-3
-#   Target: >= 60% accuracy
+# Step 5 — Case 3: SSL-pretrained frozen backbone + MLP head (non-linear probe)
+#   Only the MLP classifier is trained; backbone stays frozen (like Cases 1–2).
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "Step 5/7 — Case 3: SSL-pretrained unfrozen backbone + MLP fine-tune  ($(date))"
+echo "Step 5/7 — Case 3: frozen backbone + MLP head (SSL init)  ($(date))"
 echo "============================================================"
 python -m snn_ssl_wisdm.scripts.linear_probe_snn \
   --config     snn_ssl_wisdm/configs/default.yaml \
@@ -261,7 +260,7 @@ python -m snn_ssl_wisdm.scripts.evaluate \
   --run outputs/case2_augpred_frozen      || true
 python -m snn_ssl_wisdm.scripts.evaluate \
   --config snn_ssl_wisdm/configs/default.yaml \
-  --run outputs/case3_augpred_finetune    || true
+  --run outputs/case3_augpred_frozen_mlp   || true
 
 python -m snn_ssl_wisdm.scripts.plot_metrics --outputs outputs
 
@@ -284,7 +283,7 @@ def loadm(rel):
 
 c1 = loadm("case1_random_frozen")
 c2 = loadm("case2_augpred_frozen")
-c3 = loadm("case3_augpred_finetune")
+c3 = loadm("case3_augpred_frozen_mlp")
 pt = loadm("augpred_pretrain_snn")
 
 SEP = "=" * 76
@@ -300,7 +299,7 @@ print("  FINAL RESULTS — test set")
 print(SEP)
 if c1: print(row("Case 1  rand-frozen  (baseline)", c1))
 if c2: print(row("Case 2  ssl-frozen   (linear probe)", c2))
-if c3: print(row("Case 3  ssl-finetune (full tune)", c3))
+if c3: print(row("Case 3  ssl-frozen-mlp (MLP probe)", c3))
 
 if pt:
     print(f"\n  AugPred pretrain  best_val_loss={pt.get('best_val_loss','?'):.5f}  "
@@ -311,15 +310,12 @@ if c1 and c2:
           f"Δacc={c2['accuracy']-c1['accuracy']:+.4f}  "
           f"Δmacro_f1={c2['macro_f1']-c1['macro_f1']:+.4f}")
 if c2 and c3:
-    print(f"  Fine-tune gain (C3 − C2) : "
+    print(f"  MLP vs linear (C3 − C2) : "
           f"Δacc={c3['accuracy']-c2['accuracy']:+.4f}  "
           f"Δmacro_f1={c3['macro_f1']-c2['macro_f1']:+.4f}")
 
 if c3:
-    if c3["accuracy"] >= 0.60:
-        print(f"\n  TARGET MET: Case 3 accuracy = {c3['accuracy']:.4f}  (>= 60 %)")
-    else:
-        print(f"\n  Case 3 accuracy = {c3['accuracy']:.4f}  (target >= 60 %)")
+    print(f"\n  Case 3 (frozen backbone + MLP) test accuracy = {c3['accuracy']:.4f}")
 
 if not any([c1, c2, c3]):
     print("  No metrics.json found — check pipeline completed without errors.")

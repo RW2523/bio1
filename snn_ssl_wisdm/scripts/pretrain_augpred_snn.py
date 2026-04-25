@@ -157,8 +157,10 @@ def main():
     subjects  = bundle["subjects"]
     weights   = bundle["sample_weights"]
     meta      = bundle.get("meta", {})
-    n_chunks  = int(cfg.get("augpred", {}).get("num_perm_chunks", 4))
-    tw_strength = float(cfg.get("augpred", {}).get("time_warp_strength", 0.20))
+    ap_cfg    = cfg.get("augpred", {}) or {}
+    n_chunks  = int(ap_cfg.get("num_perm_chunks", 4))
+    tw_strength = float(ap_cfg.get("time_warp_strength", 0.20))
+    in_noise   = float(ap_cfg.get("input_noise_std", 0.0))
     T = int(bundle["windows"].shape[2])
     assert T % n_chunks == 0, (
         f"Window length T={T} must be divisible by augpred.num_perm_chunks={n_chunks}"
@@ -240,6 +242,8 @@ def main():
 
         for batch in train_loader:
             x = batch["x"].to(device, non_blocking=True)
+            if in_noise > 0:
+                x = x + torch.randn_like(x) * in_noise
             opt.zero_grad(set_to_none=True)
             with amp_ctx():
                 xa, ya  = _batch_arrow(x)

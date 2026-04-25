@@ -1,19 +1,17 @@
-"""Linear probe / fine-tune on spiking ResNet.
+"""Linear / MLP probe on spiking ResNet (backbone frozen for all cases).
 
 Three experimental cases
 ------------------------
-case1 : Randomly-initialized, frozen backbone  + linear head   (baseline)
+case1 : Randomly-initialised, frozen backbone  + linear head   (baseline)
 case2 : AugPred-pretrained,   frozen backbone  + linear head   (SSL benefit)
-case3 : AugPred-pretrained,   UNfrozen backbone + MLP head     (full fine-tune → target ≥60 %)
+case3 : AugPred-pretrained,   frozen backbone  + MLP head      (non-linear probe on SSL features)
 
-Improvements over v1
---------------------
-- Case 3 added: end-to-end fine-tuning with differential LRs (backbone 10× lower).
-- Cosine-annealing LR scheduler for all cases.
-- WeightedRandomSampler on training set (handles class imbalance).
-- Early stopping on validation balanced-accuracy (not loss) for cases 1&2;
-  on validation loss for case3 (fine-tuning can over-fit).
-- Minimum epochs guard: never stop before 20 epochs.
+All cases keep the backbone frozen. Case 3 only trains the MLP classifier on top of fixed
+representations. During training, the backbone stays in ``eval()`` so BatchNorm uses
+running statistics (correct for frozen feature extractors).
+
+Probe-stage improvements (config ``probe:``): label smoothing, MixUp, additive Gaussian
+noise during training, and optional test-time averaging (TTA) of logits over noisy views.
 """
 
 from __future__ import annotations
@@ -87,11 +85,38 @@ def _sample_weights(bundle_labels: torch.Tensor, train_idx: np.ndarray,
     return torch.from_numpy(sw.astype(np.float32))
 
 
+def _mixup_lam_perm(alpha: float, batch_size: int, device: torch.device):
+    """Returns (lam, perm) for MixUp; lam=1 disables mixing."""
+    if alpha <= 0 or batch_size < 2:
+        return 1.0, torch.arange(batch_size, device=device)
+    a = torch.tensor(float(alpha), dtype=torch.float32)
+    lam = float(torch.distributions.Beta(a, a).sample().item())
+    perm = torch.randperm(batch_size, device=device)
+    return lam, perm
+
+
 def _run_epoch(
-    model, loader, device, criterion, optimizer, scaler, amp_ctx,
-    train: bool, grad_clip: float,
+    model: HarModel,
+    loader,
+    device,
+    criterion,
+    optimizer,
+    scaler,
+    amp_ctx,
+    train: bool,
+    grad_clip: float,
+    frozen_backbone: bool,
+    train_noise_std: float = 0.0,
+    mixup_alpha: float = 0.0,
 ) -> tuple:
-    model.train() if train else model.eval()
+    if train:
+        if frozen_backbone:
+            model.backbone.eval()
+            model.head.train()
+        else:
+            model.train()
+    else:
+        model.eval()
     tot_loss = 0.0
     all_y: List[int] = []
     all_p: List[int] = []
@@ -100,11 +125,23 @@ def _run_epoch(
         for batch in loader:
             x = batch["x"].to(device, non_blocking=True)
             y = batch["y"].to(device, non_blocking=True)
+            if train and train_noise_std > 0:
+                x = x + torch.randn_like(x) * train_noise_std
+            lam_m, perm = _mixup_lam_perm(mixup_alpha, x.size(0), device)
+            if train and lam_m < 1.0:
+                x = lam_m * x + (1.0 - lam_m) * x[perm]
+                y_a, y_b = y, y[perm]
+            else:
+                y_a, y_b = y, y
+                lam_m = 1.0
             if train:
                 optimizer.zero_grad(set_to_none=True)
             with amp_ctx():
                 logits = model(x)
-                loss   = criterion(logits, y)
+                if train and lam_m < 1.0:
+                    loss = lam_m * criterion(logits, y_a) + (1.0 - lam_m) * criterion(logits, y_b)
+                else:
+                    loss = criterion(logits, y_a)
             if train:
                 scaler.scale(loss).backward()
                 if grad_clip > 0:
@@ -116,8 +153,10 @@ def _run_epoch(
                 scaler.update()
             bs = x.shape[0]
             tot_loss += float(loss.item()) * bs
-            all_y.extend(y.cpu().numpy().tolist())
-            all_p.extend(logits.argmax(-1).cpu().numpy().tolist())
+            pred = logits.argmax(-1)
+            # Under MixUp, log train acc vs primary label y_a (common proxy; val/test are clean).
+            all_y.extend(y_a.cpu().numpy().tolist())
+            all_p.extend(pred.cpu().numpy().tolist())
             n += bs
     bacc = balanced_accuracy_score(all_y, all_p) if len(all_y) > 0 else 0.0
     acc  = np.mean(np.array(all_y) == np.array(all_p)) if len(all_y) > 0 else 0.0
@@ -125,14 +164,27 @@ def _run_epoch(
 
 
 @torch.no_grad()
-def _predict_all(model, loader, device, amp_ctx) -> tuple:
+def _predict_all(
+    model: HarModel,
+    loader,
+    device,
+    amp_ctx,
+    tta_passes: int = 1,
+    tta_noise_std: float = 0.0,
+) -> tuple:
+    """Optional TTA: average logits over the clean pass + noisy copies."""
     model.eval()
     ys: List[int] = []
     ps: List[int] = []
+    tta_passes = max(1, int(tta_passes))
     for batch in loader:
         x = batch["x"].to(device, non_blocking=True)
         with amp_ctx():
-            logits = model(x)
+            logits = model(x).float()
+            if tta_passes > 1 and tta_noise_std > 0:
+                for _ in range(tta_passes - 1):
+                    logits = logits + model(x + torch.randn_like(x) * tta_noise_std).float()
+                logits = logits / float(tta_passes)
         ps.extend(logits.argmax(-1).cpu().numpy().tolist())
         ys.extend(batch["y"].numpy().tolist())
     return np.array(ys), np.array(ps)
@@ -166,8 +218,10 @@ def main():
         if v is not None:
             cli[k] = v
     if args.epochs is not None:
-        epochs_key = "epochs_finetune" if args.case == "case3" else "epochs_linear_probe"
-        cli[epochs_key] = args.epochs
+        if args.case == "case3":
+            cli["epochs_case3_mlp"] = args.epochs
+        else:
+            cli["epochs_linear_probe"] = args.epochs
     cfg = merge_dict(cfg, cli)
 
     set_seed(int(cfg["seed"]))
@@ -230,55 +284,75 @@ def main():
         backbone.load_state_dict(sd)
         print(f"[{args.case}] Loaded backbone from {args.pretrained}")
 
-    # Head selection: MLP for case3 (fine-tune), linear for cases 1&2 (probe)
+    # Head selection: MLP for case3 (frozen backbone + non-linear probe), linear for 1&2
     head_cfg    = cfg.get("head", {})
     feature_dim = int(mcfg["feature_dim"])
     if args.case == "case3":
+        h2 = head_cfg.get("hidden_dim2", None)
+        h2 = int(h2) if h2 is not None else None
         head = MLPClassifierHead(
-            in_dim     = feature_dim,
+            in_dim      = feature_dim,
             num_classes = num_classes,
-            hidden_dim  = int(head_cfg.get("hidden_dim", 256)),
-            dropout     = float(head_cfg.get("dropout",    0.3)),
+            hidden_dim  = int(head_cfg.get("hidden_dim", 512)),
+            hidden_dim2 = h2,
+            dropout     = float(head_cfg.get("dropout", 0.2)),
         ).to(device)
     else:
         head = LinearClassifierHead(feature_dim, num_classes).to(device)
 
     model = HarModel(backbone, head).to(device)
 
-    # Freeze / unfreeze backbone
+    # All cases: frozen spiking backbone (linear or MLP probe on fixed features only).
+    backbone.set_freeze(True)
+    for p in head.parameters():
+        p.requires_grad = True
+    frozen_bb = not any(p.requires_grad for p in backbone.parameters())
+    assert frozen_bb, "backbone must be frozen for cases 1–3"
     if args.case == "case3":
-        backbone.set_freeze(False)   # fine-tune everything
-        print("[case3] Backbone UNFROZEN — full fine-tuning")
+        print("[case3] Backbone FROZEN — train MLP head only (non-linear probe)")
     else:
-        backbone.set_freeze(True)    # linear probe
-        print(f"[{args.case}] Backbone FROZEN — linear probe")
+        print(f"[{args.case}] Backbone FROZEN — train linear head only")
 
-    # ── optimizer (differential LRs for case3) ────────────────────────────
-    cw        = _class_weights(labels, train_idx, num_classes, device)
-    criterion = nn.CrossEntropyLoss(weight=cw)
+    probe = cfg.get("probe") or {}
+    ls = float(probe.get("label_smoothing", 0.0))
+    train_noise = float(probe.get("train_noise_std", 0.0))
+    mixup_alpha = float(probe.get("mixup_alpha", 0.0))
+    tta_passes = int(probe.get("tta_passes", 1))
+    tta_noise = float(probe.get("tta_noise_std", 0.0))
+    min_epochs = int(probe.get("min_epochs", 20))
+
+    # ── optimizer: only head parameters (backbone frozen) ─────────────────
+    cw = _class_weights(labels, train_idx, num_classes, device)
+    try:
+        criterion = nn.CrossEntropyLoss(weight=cw, label_smoothing=ls)
+    except TypeError:
+        if ls > 0:
+            print("[warn] label_smoothing ignored (upgrade PyTorch >= 1.10).")
+        criterion = nn.CrossEntropyLoss(weight=cw)
     amp_enabled = bool(cfg.get("amp", True))
     scaler, amp_ctx = amp_scaler_and_autocast(device, amp_enabled)
     grad_clip = float(cfg["grad_clip"])
 
     if args.case == "case3":
-        lr_bb   = float(cfg.get("lr_finetune_backbone", 1e-4))
-        lr_head = float(cfg.get("lr_finetune_head",     1e-3))
-        param_groups = [
-            {"params": backbone.parameters(), "lr": lr_bb},
-            {"params": head.parameters(),     "lr": lr_head},
-        ]
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=float(cfg["weight_decay"]))
-        epochs    = int(cfg.get("epochs_finetune") or 100)
-        patience  = int(cfg.get("patience", 15))
-    else:
-        lr_head   = float(cfg.get("lr_head", 3e-3))
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=lr_head,
-            weight_decay=float(cfg["weight_decay"]),
+        lr_head = float(
+            cfg.get("lr_case3_mlp", cfg.get("lr_finetune_head", cfg.get("lr_head", 3e-3)))
         )
-        epochs   = int(cfg.get("epochs_linear_probe") or 100)
-        patience = int(cfg.get("patience", 15))
+        epochs = int(
+            cfg.get("epochs_case3_mlp")
+            or cfg.get("epochs_finetune")
+            or cfg.get("epochs_linear_probe")
+            or 100
+        )
+    else:
+        lr_head = float(cfg.get("lr_head", 3e-3))
+        epochs = int(cfg.get("epochs_linear_probe") or 100)
+
+    patience = int(probe.get("patience", cfg.get("patience", 15)))
+    optimizer = torch.optim.AdamW(
+        head.parameters(),
+        lr=lr_head,
+        weight_decay=float(cfg["weight_decay"]),
+    )
 
     # Cosine annealing with 5-epoch warm-up
     warmup = min(5, epochs // 10)
@@ -293,12 +367,11 @@ def main():
     out_name = {
         "case1": "case1_random_frozen",
         "case2": "case2_augpred_frozen",
-        "case3": "case3_augpred_finetune",
+        "case3": "case3_augpred_frozen_mlp",
     }[args.case]
     out_dir  = Path(cfg["output_root"]) / out_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    min_epochs = 20
     best_val   = -float("inf")   # track val balanced-accuracy (higher = better)
     stall      = 0
     best_state = None
@@ -308,15 +381,18 @@ def main():
     for epoch in range(1, epochs + 1):
         tr_loss, tr_acc, tr_bacc = _run_epoch(
             model, train_loader, device, criterion, optimizer,
-            scaler, amp_ctx, True, grad_clip,
+            scaler, amp_ctx, True, grad_clip, frozen_bb,
+            train_noise_std=train_noise, mixup_alpha=mixup_alpha,
         )
         va_loss, va_acc, va_bacc = _run_epoch(
             model, val_loader,   device, criterion, optimizer,
-            scaler, amp_ctx, False, 0.0,
+            scaler, amp_ctx, False, 0.0, frozen_bb,
+            train_noise_std=0.0, mixup_alpha=0.0,
         )
         te_loss, te_acc, te_bacc = _run_epoch(
             model, test_loader,  device, criterion, optimizer,
-            scaler, amp_ctx, False, 0.0,
+            scaler, amp_ctx, False, 0.0, frozen_bb,
+            train_noise_std=0.0, mixup_alpha=0.0,
         )
         cur_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else optimizer.param_groups[0]["lr"]
         scheduler.step()
@@ -360,12 +436,28 @@ def main():
         backbone.load_state_dict(best_state["backbone"])
         head.load_state_dict(best_state["head"])
 
-    # ── final evaluation ──────────────────────────────────────────────────
-    y_true, y_pred = _predict_all(model, test_loader, device, amp_ctx)
+    # ── final evaluation (optional TTA on test) ───────────────────────────
+    print(
+        f"[{args.case}] Test inference  TTA_passes={tta_passes}  "
+        f"tta_noise_std={tta_noise}  label_smoothing={ls}  mixup_alpha={mixup_alpha}"
+    )
+    y_true, y_pred = _predict_all(
+        model, test_loader, device, amp_ctx,
+        tta_passes=tta_passes, tta_noise_std=tta_noise,
+    )
     metrics = compute_metrics(y_true, y_pred, num_classes)
     metrics["case"]              = args.case
     metrics["random_baseline_acc"] = float(1.0 / num_classes)
     metrics["best_val_bacc"]     = float(best_val)
+    metrics["probe_settings"] = {
+        "label_smoothing": ls,
+        "train_noise_std": train_noise,
+        "mixup_alpha": mixup_alpha,
+        "tta_passes": tta_passes,
+        "tta_noise_std": tta_noise,
+        "min_epochs": min_epochs,
+        "patience": patience,
+    }
     save_json(out_dir / "metrics.json", metrics)
     print(
         f"\n[{args.case}] Test accuracy={metrics['accuracy']:.4f}  "

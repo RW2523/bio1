@@ -12,17 +12,16 @@ batch_size: 128
 num_workers: 4
 
 # ── training ──────────────────────────────────────────────────────────────
-epochs_linear_probe: 100      # Cases 1 & 2
-epochs_finetune: 100          # Case 3 (backbone + head jointly)
-epochs_pretrain: 200          # AugPred SSL
-patience: 15                  # early-stop patience for linear probe / fine-tune
-patience_pretrain: 30         # longer patience for SSL (avoids stopping at epoch 12)
-min_epochs_pretrain: 40       # never stop SSL before this many epochs
+epochs_linear_probe: 150      # Cases 1 & 2 (frozen backbone + linear head)
+epochs_case3_mlp: 150         # Case 3 (frozen backbone + MLP head)
+epochs_pretrain: 300          # AugPred SSL (longer → richer frozen features)
+patience: 22                  # default early-stop (overridden by probe.patience)
+patience_pretrain: 45        # SSL patience
+min_epochs_pretrain: 50      # never stop SSL before this many epochs
 
-lr_head: 3.0e-3               # linear probe head LR
-lr_finetune_head: 1.0e-3      # case3 MLP head LR
-lr_finetune_backbone: 1.0e-4  # case3 backbone LR (10x smaller)
-lr_pretrain: 5.0e-4           # AugPred LR
+lr_head: 4.0e-3               # Cases 1 & 2 linear head LR
+lr_case3_mlp: 4.0e-3          # Case 3 MLP head LR
+lr_pretrain: 8.0e-4          # AugPred LR (slightly higher with input noise)
 weight_decay: 1.0e-4
 grad_clip: 1.0
 amp: true
@@ -38,9 +37,8 @@ splits_path: snn_ssl_wisdm/processed/splits_seed42.json
 # ── spiking neuron ─────────────────────────────────────────────────────────
 spiking:
   timesteps: 4
-  beta: 0.5           # tau = 1/(1-beta) = 2 → SpikingJelly convention: v += x/tau = 0.5*x
-  threshold: 0.5      # CRITICAL: lower threshold ensures ~16-27% firing rate on N(0,1) features
-                      # With threshold=1.0 and tau=2, only 2% fire → near-silent network
+  beta: 0.5           # tau = 1/(1-beta) = 2 → SpikingJelly: v += x/tau
+  threshold: 0.5      # healthy firing on N(0,1) BN features
   detach_reset: true
 
 # ── model ──────────────────────────────────────────────────────────────────
@@ -50,16 +48,28 @@ model:
   feature_dim: 512
   in_channels: 3
 
-# ── case3 head ─────────────────────────────────────────────────────────────
+# ── frozen probe training (all cases) ─────────────────────────────────────
+probe:
+  label_smoothing: 0.08
+  mixup_alpha: 0.28           # 0 disables MixUp
+  train_noise_std: 0.045      # additive Gaussian on normalised windows (train only)
+  tta_passes: 10              # test-time logit average (1 = off)
+  tta_noise_std: 0.018        # noise std for extra TTA views
+  min_epochs: 22              # early-stop guard
+  patience: 28                # early-stop patience (val balanced accuracy)
+
+# ── case3: frozen backbone + deeper MLP head ────────────────────────────────
 head:
-  type: mlp          # mlp | linear
-  hidden_dim: 256
-  dropout: 0.3
+  type: mlp
+  hidden_dim: 512
+  hidden_dim2: 256
+  dropout: 0.18
 
 # ── output ─────────────────────────────────────────────────────────────────
 output_root: outputs
 
-# ── augpred ────────────────────────────────────────────────────────────────
+# ── augpred SSL ────────────────────────────────────────────────────────────
 augpred:
-  num_perm_chunks: 4         # also = number of rotation classes
-  time_warp_strength: 0.20   # slightly stronger warp for more discriminative signal
+  num_perm_chunks: 4
+  time_warp_strength: 0.22
+  input_noise_std: 0.028      # Gaussian on raw batch before pretext transforms (train)

@@ -8,7 +8,7 @@
 # Cases run:
 #   Case 1 : random frozen backbone   + linear head  (baseline)
 #   Case 2 : AugPred-pretrained frozen + linear head (SSL benefit)
-#   Case 3 : AugPred-pretrained unfrozen + MLP head  (full fine-tune → ≥60%)
+#   Case 3 : AugPred-pretrained frozen backbone + MLP head (non-linear probe)
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -41,10 +41,10 @@ else
   echo "== Full: prepare (all subjects)"
   python -m snn_ssl_wisdm.scripts.prepare_wisdm \
     --config snn_ssl_wisdm/configs/default.yaml
-  # epochs from config (epochs_linear_probe / epochs_finetune / epochs_pretrain)
-  EP_L=100
-  EP_P=200
-  EP_F=100
+  # Match default.yaml: 150 / 150 / 300 (CLI --epochs overrides config)
+  EP_L=150
+  EP_P=300
+  EP_F=150
 fi
 
 # ── Case 1: random frozen backbone + linear head ────────────────────────────
@@ -73,9 +73,9 @@ python -m snn_ssl_wisdm.scripts.linear_probe_snn \
   --pretrained "$PRETRAINED" \
   --epochs "$EP_L"
 
-# ── Case 3: AugPred-pretrained unfrozen backbone + MLP head (fine-tune) ──
+# ── Case 3: AugPred-pretrained frozen backbone + MLP head ──────────────────
 echo ""
-echo "== Case 3: full fine-tune (AugPred init, unfrozen backbone, MLP head)"
+echo "== Case 3: frozen backbone + MLP head (SSL init, train head only)"
 python -m snn_ssl_wisdm.scripts.linear_probe_snn \
   --config snn_ssl_wisdm/configs/default.yaml \
   --case case3 \
@@ -93,7 +93,7 @@ python -m snn_ssl_wisdm.scripts.evaluate \
   --run outputs/case2_augpred_frozen || true
 python -m snn_ssl_wisdm.scripts.evaluate \
   --config snn_ssl_wisdm/configs/default.yaml \
-  --run outputs/case3_augpred_finetune || true
+  --run outputs/case3_augpred_frozen_mlp || true
 
 echo ""
 echo "== Plot aggregate"
@@ -115,7 +115,7 @@ def loadm(p):
 
 c1 = loadm("case1_random_frozen")
 c2 = loadm("case2_augpred_frozen")
-c3 = loadm("case3_augpred_finetune")
+c3 = loadm("case3_augpred_frozen_mlp")
 
 def row(tag, d):
     bacc = d.get("balanced_accuracy", 0)
@@ -130,13 +130,13 @@ print("   FINAL COMPARISON — test set")
 print("="*75)
 if c1: print(row("Case1 (rand-frz)",  c1))
 if c2: print(row("Case2 (ssl-frz)",   c2))
-if c3: print(row("Case3 (ssl-tune)",  c3))
+if c3: print(row("Case3 (ssl-mlp)",  c3))
 if c1 and c2:
     delta_acc = c2['accuracy'] - c1['accuracy']
     print(f"\n  SSL benefit (C2-C1): Δacc={delta_acc:+.4f}  Δmacro_f1={c2['macro_f1']-c1['macro_f1']:+.4f}")
 if c2 and c3:
     delta_acc = c3['accuracy'] - c2['accuracy']
-    print(f"  Fine-tune gain (C3-C2): Δacc={delta_acc:+.4f}  Δmacro_f1={c3['macro_f1']-c2['macro_f1']:+.4f}")
+    print(f"  MLP vs linear (C3-C2): Δacc={delta_acc:+.4f}  Δmacro_f1={c3['macro_f1']-c2['macro_f1']:+.4f}")
 if not any([c1, c2, c3]):
     print("  No metrics found — check that the pipeline completed without errors.")
 print("="*75)
