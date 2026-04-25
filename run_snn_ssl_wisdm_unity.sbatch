@@ -1,49 +1,35 @@
 #!/bin/bash
-#SBATCH --job-name=snn_ssl_wisdm
-#SBATCH --output=logs/%x_%j.out
-#SBATCH --error=logs/%x_%j.err
-#
-# GPU / partition (IMPORTANT)
-# ---------------------------
-# Default targets UMass Unity A100 nodes (avoids Maxwell/Pascal-only pools where
-# PyTorch 2.x wheels raise: "CUDA error: no kernel image is available for the device").
-#
-# If sbatch is rejected on your site, comment the two lines below and uncomment ONE
-# alternate block, or ask your admins for the correct partition / --gres syntax.
-#
-#SBATCH --partition=superpod-a100
-#SBATCH --gres=gpu:1
-#
-# --- Alternate: UMass Unity L40S pod ---
-##SBATCH --partition=gpupod-l40s
-##SBATCH --gres=gpu:1
-#
-# --- Alternate: Cambridge CSD3 Wilkes3 A100 ---
-##SBATCH -p ampere
-##SBATCH --gres=gpu:1
-##SBATCH --cpus-per-task=32
-##SBATCH --mem=128G
-#
-# --- Alternate: generic "gpu" pool (RISKY: may land on old GPUs; prefer constrained partition) ---
-##SBATCH --partition=gpu
-##SBATCH --gres=gpu:1
-
+# ---------------------------------------------------------------------------
+# Slurm header (Unity reference — keep walltime + A100 constraint stable unless
+# site policy changes). PyTorch cu121 wheels need Turing+ / A100-class GPUs.
+# ---------------------------------------------------------------------------
+#SBATCH --job-name=wisdm-unity-full
+#SBATCH --partition=gpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=64G
-#SBATCH --time=24:00:00
+#SBATCH --mem=128G
+#SBATCH --time=04:00:00
+#SBATCH --gpus=1
+#SBATCH --constraint=a100
+# Full pipeline: omit --qos=short (short QoS is for small priority-boosted jobs;
+# can confuse long runs). For a one-off interactive boost on a *short* test, add
+# on sbatch line: --qos=short (see Unity docs).
+#SBATCH --output=slurm-unity-full-%j.out
+#SBATCH --error=slurm-unity-full-%j.err
 
 set -euo pipefail
 
 echo "============================================================"
 echo "Job ID: ${SLURM_JOB_ID:-none}"
-echo "Job name: ${SLURM_JOB_NAME:-snn_ssl_wisdm}"
+echo "Job name: ${SLURM_JOB_NAME:-wisdm-unity-full}"
 echo "Node: $(hostname)"
 echo "Slurm partition: ${SLURM_JOB_PARTITION:-unknown}"
 echo "Start time: $(date)"
 echo "Working directory: $(pwd)"
 echo "============================================================"
 
-mkdir -p logs outputs
+mkdir -p outputs
 
 # ---------------------------------------------------------------------
 # Set project root.

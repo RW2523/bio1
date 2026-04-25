@@ -6,7 +6,7 @@ Monorepo layout:
 - **`SpikeGPT/`** — SpikingJelly / reference SNN code (vendored for imports).
 - **`ssl-wearables/`** — Original Oxford SSL HAR codebase (reference / PYTHONPATH).
 - **`wisdm-dataset/`** — WISDM raw and ARFF data ([dataset README](wisdm-dataset/README.txt)).
-- **`run_snn_ssl_wisdm_unity.sbatch`** — Slurm job for Unity clusters (defaults to **A100** partition on UMass Unity to avoid old-GPU + PyTorch wheel mismatches).
+- **`run_snn_ssl_wisdm_unity.sbatch`** — Slurm job for Unity: **`partition=gpu`**, **`--constraint=a100`**, **`--time=04:00:00`**, **`--gpus=1`** (fixed in the script header unless Unity policy changes). Stdout/stderr: **`slurm-unity-full-<jobid>.out`** / **`.err`** in the submit directory.
 
 Quick start (from this directory):
 
@@ -24,11 +24,10 @@ Use these on a **Unity login node** after the repo is on the cluster (clone or `
 
 ```bash
 cd /path/to/bio1
-mkdir -p logs
 sbatch run_snn_ssl_wisdm_unity.sbatch
 ```
 
-Replace `/path/to/bio1` with your real project path on Unity. Slurm prints a job id (e.g. `Submitted batch job 12345678`).
+Replace `/path/to/bio1` with your real project path on Unity. Slurm prints a job id (e.g. `Submitted batch job 12345678`). Logs are written as **`slurm-unity-full-<jobid>.out`** and **`slurm-unity-full-<jobid>.err`** in the directory you submitted from.
 
 ### Watch the job (optional)
 
@@ -39,12 +38,12 @@ squeue -u "$USER"
 ### Read stdout and stderr
 
 ```bash
-ls -lt logs/
-tail -f logs/snn_ssl_wisdm_<JOBID>.out
-tail -f logs/snn_ssl_wisdm_<JOBID>.err
+ls -lt slurm-unity-full-*.out slurm-unity-full-*.err
+tail -f slurm-unity-full-<JOBID>.out
+tail -f slurm-unity-full-<JOBID>.err
 ```
 
-Substitute `<JOBID>` with the id from `sbatch`.
+Replace `<JOBID>` with the numeric id from `sbatch` (same id in both filenames).
 
 ### Optional: conda env name or project root
 
@@ -72,9 +71,9 @@ Recent **PyTorch CUDA wheels** (e.g. cu121) ship GPU kernels for **Turing (sm_75
 
 `torch.AcceleratorError: CUDA error: no kernel image is available for execution on the device`
 
-**Fix (recommended):** request a **newer GPU partition** (e.g. UMass Unity [`superpod-a100`](https://docs.unity.rc.umass.edu/documentation/cluster_specs/partitions) or `gpupod-l40s`). The repo’s `run_snn_ssl_wisdm_unity.sbatch` defaults to **`#SBATCH --partition=superpod-a100`** and **`#SBATCH --gres=gpu:1`**, and runs an early **compute-capability + CUDA matmul probe** so the job **fails fast** with a clear message instead of dying mid–linear probe.
+**Fix (recommended):** request **A100** nodes via Slurm (this repo uses **`--partition=gpu`** + **`--constraint=a100`**). The sbatch script also runs an early **compute-capability + CUDA matmul probe** so the job **fails fast** with a clear message instead of dying mid–linear probe.
 
-**If your Unity is not UMass:** edit the top of `run_snn_ssl_wisdm_unity.sbatch` — comment the `superpod-a100` lines and uncomment one of the **alternate** blocks (e.g. Cambridge CSD3 **`-p ampere`**) or ask your admins for the correct **partition / `--gres`** syntax.
+**Wall clock:** the header uses **`#SBATCH --time=04:00:00`** as the project default. If a full run needs longer, increase **only** `--time` in agreement with Unity policy (keep **`--constraint=a100`** unless admins say otherwise).
 
 The sbatch script also **`pip install`s PyTorch with `--index-url https://download.pytorch.org/whl/cu121`** after `requirements_unity.txt` so the job gets a **CUDA-enabled** build on the node.
 

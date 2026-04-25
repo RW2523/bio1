@@ -22,6 +22,8 @@ outputs/
 snn_ssl_wisdm/processed/*.pt
 logs/*.out
 logs/*.err
+slurm-unity-full-*.out
+slurm-unity-full-*.err
 
 # Optional: large local experiment dirs (uncomment if you do not want raw data on GitHub)
 # wisdm-dataset/raw/
