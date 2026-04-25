@@ -114,7 +114,8 @@ python -m pip install --upgrade "torch>=2.1.0" "torchvision" "torchaudio" \
   }
 
 # Make local packages visible.
-export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/SpikeGPT/src:$PROJECT_ROOT/ssl-wearables:$PYTHONPATH"
+# NOTE: use ${PYTHONPATH:-} because `set -u` makes an unset PYTHONPATH an error on some clusters.
+export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/SpikeGPT/src:$PROJECT_ROOT/ssl-wearables:${PYTHONPATH:-}"
 
 echo "CUDA / GPU preflight:"
 python - <<'PY'
