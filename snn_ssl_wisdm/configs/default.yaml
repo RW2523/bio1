@@ -10,30 +10,56 @@ stride_seconds: 5
 num_classes: 18
 batch_size: 128
 num_workers: 4
-epochs_linear_probe: 50
-epochs_pretrain: 100
-lr_head: 0.001
-lr_pretrain: 0.001
-weight_decay: 0.0001
-patience: 10
+
+# ── training ──────────────────────────────────────────────────────────────
+epochs_linear_probe: 100      # Cases 1 & 2
+epochs_finetune: 100          # Case 3 (backbone + head jointly)
+epochs_pretrain: 200          # AugPred SSL
+patience: 15                  # early-stop patience for linear probe / fine-tune
+patience_pretrain: 30         # longer patience for SSL (avoids stopping at epoch 12)
+min_epochs_pretrain: 40       # never stop SSL before this many epochs
+
+lr_head: 3.0e-3               # linear probe head LR
+lr_finetune_head: 1.0e-3      # case3 MLP head LR
+lr_finetune_backbone: 1.0e-4  # case3 backbone LR (10x smaller)
+lr_pretrain: 5.0e-4           # AugPred LR
+weight_decay: 1.0e-4
 grad_clip: 1.0
 amp: true
+
 limit_subjects: null
 max_windows: null
 epochs: null
+
+# ── paths ──────────────────────────────────────────────────────────────────
 processed_path: snn_ssl_wisdm/processed/wisdm_watch_accel_10s.pt
 splits_path: snn_ssl_wisdm/processed/splits_seed42.json
+
+# ── spiking neuron ─────────────────────────────────────────────────────────
 spiking:
   timesteps: 4
-  beta: 0.5
-  threshold: 1.0
+  beta: 0.5           # tau = 1/(1-beta) = 2 → SpikingJelly convention: v += x/tau = 0.5*x
+  threshold: 0.5      # CRITICAL: lower threshold ensures ~16-27% firing rate on N(0,1) features
+                      # With threshold=1.0 and tau=2, only 2% fire → near-silent network
   detach_reset: true
+
+# ── model ──────────────────────────────────────────────────────────────────
 model:
   base_channels: 64
   layers: [2, 2, 2, 2]
   feature_dim: 512
   in_channels: 3
+
+# ── case3 head ─────────────────────────────────────────────────────────────
+head:
+  type: mlp          # mlp | linear
+  hidden_dim: 256
+  dropout: 0.3
+
+# ── output ─────────────────────────────────────────────────────────────────
 output_root: outputs
+
+# ── augpred ────────────────────────────────────────────────────────────────
 augpred:
-  num_perm_chunks: 4
-  time_warp_strength: 0.15
+  num_perm_chunks: 4         # also = number of rotation classes
+  time_warp_strength: 0.20   # slightly stronger warp for more discriminative signal
