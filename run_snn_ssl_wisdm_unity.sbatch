@@ -2,9 +2,33 @@
 #SBATCH --job-name=snn_ssl_wisdm
 #SBATCH --output=logs/%x_%j.out
 #SBATCH --error=logs/%x_%j.err
-#SBATCH --partition=gpu
+#
+# GPU / partition (IMPORTANT)
+# ---------------------------
+# Default targets UMass Unity A100 nodes (avoids Maxwell/Pascal-only pools where
+# PyTorch 2.x wheels raise: "CUDA error: no kernel image is available for the device").
+#
+# If sbatch is rejected on your site, comment the two lines below and uncomment ONE
+# alternate block, or ask your admins for the correct partition / --gres syntax.
+#
+#SBATCH --partition=superpod-a100
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#
+# --- Alternate: UMass Unity L40S pod ---
+##SBATCH --partition=gpupod-l40s
+##SBATCH --gres=gpu:1
+#
+# --- Alternate: Cambridge CSD3 Wilkes3 A100 ---
+##SBATCH -p ampere
+##SBATCH --gres=gpu:1
+##SBATCH --cpus-per-task=32
+##SBATCH --mem=128G
+#
+# --- Alternate: generic "gpu" pool (RISKY: may land on old GPUs; prefer constrained partition) ---
+##SBATCH --partition=gpu
+##SBATCH --gres=gpu:1
+
+#SBATCH --cpus-per-task=16
 #SBATCH --mem=64G
 #SBATCH --time=24:00:00
 
@@ -14,6 +38,7 @@ echo "============================================================"
 echo "Job ID: ${SLURM_JOB_ID:-none}"
 echo "Job name: ${SLURM_JOB_NAME:-snn_ssl_wisdm}"
 echo "Node: $(hostname)"
+echo "Slurm partition: ${SLURM_JOB_PARTITION:-unknown}"
 echo "Start time: $(date)"
 echo "Working directory: $(pwd)"
 echo "============================================================"
@@ -23,7 +48,7 @@ mkdir -p logs outputs
 # ---------------------------------------------------------------------
 # Set project root.
 # Recommended usage:
-#   cd /path/to/new_b
+#   cd /path/to/bio1
 #   sbatch run_snn_ssl_wisdm_unity.sbatch
 # ---------------------------------------------------------------------
 PROJECT_ROOT="${PROJECT_ROOT:-$(pwd)}"
@@ -70,6 +95,8 @@ python --version
 
 # ---------------------------------------------------------------------
 # Install dependencies.
+# Install a CUDA-enabled PyTorch explicitly (default pip "torch" can be CPU-only
+# or omit sm_52 Maxwell anyway — old GPUs still fail at kernel launch).
 # ---------------------------------------------------------------------
 python -m pip install --upgrade pip wheel setuptools
 
@@ -78,21 +105,54 @@ if [ -f "snn_ssl_wisdm/requirements_unity.txt" ]; then
 else
     echo "requirements_unity.txt not found yet. Installing baseline dependencies."
     python -m pip install numpy pandas scipy scikit-learn matplotlib seaborn tqdm pyyaml
-    python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 || \
-    python -m pip install torch torchvision torchaudio
 fi
+
+echo "Installing PyTorch with CUDA 12.1 wheels (Turing sm_75+ / Ampere / Ada / Hopper-class GPUs)."
+python -m pip install --upgrade "torch>=2.1.0" "torchvision" "torchaudio" \
+  --index-url https://download.pytorch.org/whl/cu121 || {
+    echo "WARNING: cu121 wheel install failed; continuing with whatever torch is present."
+  }
 
 # Make local packages visible.
 export PYTHONPATH="$PROJECT_ROOT:$PROJECT_ROOT/SpikeGPT/src:$PROJECT_ROOT/ssl-wearables:$PYTHONPATH"
 
-echo "CUDA check:"
+echo "CUDA / GPU preflight:"
 python - <<'PY'
+import sys
 import torch
+
 print("torch:", torch.__version__)
+print("cuda built:", torch.version.cuda)
 print("cuda available:", torch.cuda.is_available())
-if torch.cuda.is_available():
-    print("gpu:", torch.cuda.get_device_name(0))
-    print("capability:", torch.cuda.get_device_capability(0))
+if not torch.cuda.is_available():
+    print("ERROR: CUDA is not available to PyTorch on this node.", file=sys.stderr)
+    sys.exit(2)
+
+name = torch.cuda.get_device_name(0)
+cap = torch.cuda.get_device_capability(0)
+print("gpu:", name)
+print("compute capability:", cap)
+
+# Official manylinux cu121 wheels target sm_75+ (Turing) and newer; Maxwell (5.x) is unsupported.
+min_major, min_minor = 7, 5
+if cap < (min_major, min_minor):
+    print(
+        f"ERROR: GPU {name} is sm_{cap[0]}{cap[1]}. "
+        f"This PyTorch build needs compute capability >= {min_major}.{min_minor} "
+        f"(e.g. RTX 20-series+, A100, L40S). Re-submit on an A100/L40S partition, "
+        f"or use an older PyTorch+cuda build that still ships Maxwell kernels.",
+        file=sys.stderr,
+    )
+    sys.exit(3)
+
+# One tiny kernel to catch "no kernel image" mismatches early.
+try:
+    x = torch.zeros(256, 256, device="cuda")
+    torch.nn.functional.relu(x @ x)
+except Exception as e:
+    print("ERROR: CUDA kernel probe failed:", e, file=sys.stderr)
+    sys.exit(4)
+print("CUDA kernel probe: OK")
 PY
 
 # ---------------------------------------------------------------------
