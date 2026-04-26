@@ -9,6 +9,12 @@ Improvements over v1:
   - min_epochs_pretrain guard so SSL never stops too early.
   - Increased default patience (patience_pretrain in config).
   - Per-batch backbone reset is eliminated (see spiking_resnet1d.py).
+
+Additional stability improvements:
+  - Track per-task accuracies (AoT, rotation, time-warp, scale).
+  - Select best backbone by mean validation pretext accuracy (not val loss).
+    Val loss can stay near the random baseline (~0.866) even when accuracies improve
+    because CE/BCE scales differ; accuracy is a clearer signal for representation quality.
 """
 
 from __future__ import annotations
@@ -123,6 +129,18 @@ def _batch_scale(
 # Main
 # ---------------------------------------------------------------------------
 
+def _bin_acc(logits: torch.Tensor, y: torch.Tensor) -> float:
+    """Binary accuracy for BCE-with-logits tasks."""
+    p = (logits.squeeze(-1) >= 0).long()
+    return float((p == y).float().mean().item())
+
+
+def _mc_acc(logits: torch.Tensor, y: torch.Tensor) -> float:
+    """Multi-class accuracy for CE tasks."""
+    p = logits.argmax(dim=-1)
+    return float((p == y).float().mean().item())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config",          type=str, required=True)
@@ -230,7 +248,8 @@ def main():
     log_path = out_dir / "train_log.csv"
 
     rows: List[Dict] = []
-    best_val  = float("inf")
+    best_val_loss  = float("inf")
+    best_val_score = -float("inf")
     stall     = 0
     best_sd   = None
 
@@ -239,6 +258,10 @@ def main():
         heads.train()
         tr_tot = 0.0
         tr_n   = 0
+        tr_aot = 0.0
+        tr_rot = 0.0
+        tr_tw  = 0.0
+        tr_sc  = 0.0
 
         for batch in train_loader:
             x = batch["x"].to(device, non_blocking=True)
@@ -256,10 +279,15 @@ def main():
                 zc = backbone(xt)
                 zs = backbone(xs)
 
-                la = bce(heads.head_aot(za).squeeze(-1),    ya.float())
-                lr_loss = ce(heads.head_perm(zr),           yr)          # 4-class rotation
-                lc = bce(heads.head_tw(zc).squeeze(-1),     yt.float())
-                ls = bce(heads.head_scale(zs).squeeze(-1),  ys.float())
+                log_a = heads.head_aot(za)
+                log_r = heads.head_perm(zr)
+                log_t = heads.head_tw(zc)
+                log_s = heads.head_scale(zs)
+
+                la = bce(log_a.squeeze(-1), ya.float())
+                lr_loss = ce(log_r, yr)  # 4-class rotation
+                lc = bce(log_t.squeeze(-1), yt.float())
+                ls = bce(log_s.squeeze(-1), ys.float())
                 loss = (la + lr_loss + lc + ls) / 4.0
 
             scaler.scale(loss).backward()
@@ -272,14 +300,27 @@ def main():
             scaler.update()
             tr_tot += float(loss.item()) * x.shape[0]
             tr_n   += x.shape[0]
+            with torch.no_grad():
+                tr_aot += _bin_acc(log_a, ya) * x.shape[0]
+                tr_rot += _mc_acc(log_r, yr) * x.shape[0]
+                tr_tw  += _bin_acc(log_t, yt) * x.shape[0]
+                tr_sc  += _bin_acc(log_s, ys) * x.shape[0]
 
         tr_loss = tr_tot / max(1, tr_n)
+        tr_aot = tr_aot / max(1, tr_n)
+        tr_rot = tr_rot / max(1, tr_n)
+        tr_tw  = tr_tw  / max(1, tr_n)
+        tr_sc  = tr_sc  / max(1, tr_n)
 
         # ── validation ────────────────────────────────────────────────────
         backbone.eval()
         heads.eval()
         va_tot = 0.0
         va_n   = 0
+        va_aot = 0.0
+        va_rot = 0.0
+        va_tw  = 0.0
+        va_sc  = 0.0
         with torch.no_grad():
             for batch in val_loader:
                 x = batch["x"].to(device, non_blocking=True)
@@ -292,41 +333,80 @@ def main():
                     zr = backbone(xr)
                     zc = backbone(xt)
                     zs = backbone(xs)
-                    la = bce(heads.head_aot(za).squeeze(-1),    ya.float())
-                    lr_loss = ce(heads.head_perm(zr),           yr)
-                    lc = bce(heads.head_tw(zc).squeeze(-1),     yt.float())
-                    ls = bce(heads.head_scale(zs).squeeze(-1),  ys.float())
+                    log_a = heads.head_aot(za)
+                    log_r = heads.head_perm(zr)
+                    log_t = heads.head_tw(zc)
+                    log_s = heads.head_scale(zs)
+
+                    la = bce(log_a.squeeze(-1), ya.float())
+                    lr_loss = ce(log_r, yr)
+                    lc = bce(log_t.squeeze(-1), yt.float())
+                    ls = bce(log_s.squeeze(-1), ys.float())
                     loss = (la + lr_loss + lc + ls) / 4.0
                 va_tot += float(loss.item()) * x.shape[0]
                 va_n   += x.shape[0]
+                va_aot += _bin_acc(log_a, ya) * x.shape[0]
+                va_rot += _mc_acc(log_r, yr) * x.shape[0]
+                va_tw  += _bin_acc(log_t, yt) * x.shape[0]
+                va_sc  += _bin_acc(log_s, ys) * x.shape[0]
         va_loss = va_tot / max(1, va_n)
+        va_aot = va_aot / max(1, va_n)
+        va_rot = va_rot / max(1, va_n)
+        va_tw  = va_tw  / max(1, va_n)
+        va_sc  = va_sc  / max(1, va_n)
+        va_score = (va_aot + va_rot + va_tw + va_sc) / 4.0
 
         cur_lr = scheduler.get_last_lr()[0] if hasattr(scheduler, "get_last_lr") else opt.param_groups[0]["lr"]
         scheduler.step()
 
-        rows.append({"epoch": epoch, "train_loss": tr_loss, "val_loss": va_loss, "lr": cur_lr})
+        rows.append({
+            "epoch": epoch,
+            "train_loss": tr_loss,
+            "val_loss": va_loss,
+            "val_score": va_score,
+            "train_aot_acc": tr_aot,
+            "train_rot_acc": tr_rot,
+            "train_tw_acc": tr_tw,
+            "train_scale_acc": tr_sc,
+            "val_aot_acc": va_aot,
+            "val_rot_acc": va_rot,
+            "val_tw_acc": va_tw,
+            "val_scale_acc": va_sc,
+            "lr": cur_lr,
+        })
         print(
             f"epoch {epoch:03d}/{epochs}  pretrain  "
-            f"train_loss={tr_loss:.4f}  val_loss={va_loss:.4f}  lr={cur_lr:.2e}"
+            f"train_loss={tr_loss:.4f}  val_loss={va_loss:.4f}  val_score={va_score:.4f}  lr={cur_lr:.2e}"
         )
         with open(log_path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
             w.writeheader()
             w.writerows(rows)
 
-        if va_loss < best_val - 1e-6:
-            best_val = va_loss
+        # Select checkpoint by mean pretext accuracy (higher is better).
+        if va_score > best_val_score + 1e-6:
+            best_val_score = va_score
+            best_val_loss = min(best_val_loss, va_loss)
             stall    = 0
             best_sd  = {
                 "backbone": {k: v.cpu() for k, v in backbone.state_dict().items()},
                 "heads":    {k: v.cpu() for k, v in heads.state_dict().items()},
                 "epoch":    epoch,
+                "val_loss": float(va_loss),
+                "val_score": float(va_score),
+                "val_aot_acc": float(va_aot),
+                "val_rot_acc": float(va_rot),
+                "val_tw_acc": float(va_tw),
+                "val_scale_acc": float(va_sc),
             }
             torch.save({"backbone": best_sd["backbone"]}, out_dir / "best_backbone.pt")
         else:
             stall += 1
             if epoch >= min_epochs and stall >= patience:
-                print(f"Early stopping pretrain at epoch {epoch}  (best_val={best_val:.5f})")
+                print(
+                    f"Early stopping pretrain at epoch {epoch}  "
+                    f"(best_val_score={best_val_score:.4f}, best_epoch={best_sd['epoch'] if best_sd else -1})"
+                )
                 break
 
     if best_sd is not None:
@@ -334,7 +414,21 @@ def main():
         heads.load_state_dict(best_sd["heads"])
 
     from snn_ssl_wisdm.train_utils import save_json
-    save_json(out_dir / "metrics.json", {"best_val_loss": best_val, "best_epoch": best_sd["epoch"] if best_sd else -1, "meta": meta})
+    save_json(
+        out_dir / "metrics.json",
+        {
+            "best_val_loss": float(best_sd.get("val_loss", best_val_loss)) if best_sd else float(best_val_loss),
+            "best_val_score": float(best_sd.get("val_score", best_val_score)) if best_sd else float(best_val_score),
+            "best_epoch": int(best_sd["epoch"]) if best_sd else -1,
+            "best_val_task_acc": {
+                "aot": float(best_sd.get("val_aot_acc", 0.0)) if best_sd else 0.0,
+                "rot": float(best_sd.get("val_rot_acc", 0.0)) if best_sd else 0.0,
+                "tw": float(best_sd.get("val_tw_acc", 0.0)) if best_sd else 0.0,
+                "scale": float(best_sd.get("val_scale_acc", 0.0)) if best_sd else 0.0,
+            },
+            "meta": meta,
+        },
+    )
     if rows:
         viz.plot_loss_curves(rows, out_dir / "loss_curve.png")
     print(f"[pretrain] Saved backbone → {out_dir / 'best_backbone.pt'}")
