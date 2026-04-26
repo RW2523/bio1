@@ -9,7 +9,7 @@
 # Pipeline (all 3 cases inlined, no external run_all.sh needed):
 #   Step 1  prepare_wisdm     — sliding windows, normalise, subject splits
 #   Step 2  Case 1            — random-init   frozen backbone + linear probe
-#   Step 3  AugPred pretrain  — 4-task SSL (rotation/AoT/time-warp/scale)
+#   Step 3  SimCLR pretrain   — NT-Xent contrastive (two augmented views / window)
 #   Step 4  Case 2            — SSL-pretrained frozen backbone + linear probe
 #   Step 5  Case 3            — SSL-pretrained frozen backbone + MLP head (non-linear probe)
 #   Step 6  evaluate + plots
@@ -47,8 +47,8 @@ echo "============================================================"
 echo ""
 echo "3-case SNN+SSL+WISDM pipeline"
 echo "  Case 1 : random-init frozen ResNet  + linear probe    (baseline)"
-echo "  Case 2 : AugPred SSL-pretrained frozen + linear probe (SSL benefit)"
-echo "  Case 3 : AugPred SSL-pretrained frozen + MLP head (train head only)"
+echo "  Case 2 : SimCLR SSL-pretrained frozen + linear probe (SSL benefit)"
+echo "  Case 3 : SimCLR SSL-pretrained frozen + MLP head (train head only)"
 echo ""
 echo "SNN config: beta=0.5 (tau=2), threshold=0.5 → ~16-27% neuron firing rate"
 echo "============================================================"
@@ -178,10 +178,10 @@ echo "All required folders present."
 # --smoke flag from the CLI if you want a quick sanity check locally).
 # These match the values in snn_ssl_wisdm/configs/default.yaml.
 # =============================================================================
-EP_P=300    # epochs_pretrain  (AugPred SSL; matches default.yaml)
+EP_P=300    # epochs_pretrain  (SimCLR; matches default.yaml)
 EP_L=150    # epochs_linear_probe (Cases 1 & 2)
 EP_F=150    # epochs_case3_mlp  (Case 3: frozen backbone + MLP head)
-PRETRAINED="outputs/augpred_pretrain_snn/best_backbone.pt"
+PRETRAINED="outputs/simclr_pretrain_snn/best_backbone.pt"
 
 # =============================================================================
 # Step 1 — Prepare WISDM data
@@ -206,15 +206,13 @@ python -m snn_ssl_wisdm.scripts.linear_probe_snn \
   --epochs  "$EP_L"
 
 # =============================================================================
-# Step 3 — AugPred self-supervised pretraining
-#   4 pretext tasks: rotation (4-class CE), arrow-of-time, time-warp, amplitude-scale
-#   Cosine-annealing LR, patience=30, min_epochs=40
+# Step 3 — SimCLR contrastive pretraining (NT-Xent, two views per window)
 # =============================================================================
 echo ""
 echo "============================================================"
-echo "Step 3/7 — AugPred SSL pretraining  ($(date))"
+echo "Step 3/7 — SimCLR SSL pretraining  ($(date))"
 echo "============================================================"
-python -m snn_ssl_wisdm.scripts.pretrain_augpred_snn \
+python -m snn_ssl_wisdm.scripts.pretrain_simclr_snn \
   --config  snn_ssl_wisdm/configs/default.yaml \
   --epochs  "$EP_P"
 
@@ -257,10 +255,10 @@ python -m snn_ssl_wisdm.scripts.evaluate \
   --run outputs/case1_random_frozen       || true
 python -m snn_ssl_wisdm.scripts.evaluate \
   --config snn_ssl_wisdm/configs/default.yaml \
-  --run outputs/case2_augpred_frozen      || true
+  --run outputs/case2_simclr_frozen      || true
 python -m snn_ssl_wisdm.scripts.evaluate \
   --config snn_ssl_wisdm/configs/default.yaml \
-  --run outputs/case3_augpred_frozen_mlp   || true
+  --run outputs/case3_simclr_frozen_mlp   || true
 
 python -m snn_ssl_wisdm.scripts.plot_metrics --outputs outputs
 
@@ -282,9 +280,9 @@ def loadm(rel):
     return json.load(open(f)) if f.is_file() else None
 
 c1 = loadm("case1_random_frozen")
-c2 = loadm("case2_augpred_frozen")
-c3 = loadm("case3_augpred_frozen_mlp")
-pt = loadm("augpred_pretrain_snn")
+c2 = loadm("case2_simclr_frozen")
+c3 = loadm("case3_simclr_frozen_mlp")
+pt = loadm("simclr_pretrain_snn")
 
 SEP = "=" * 76
 
@@ -298,12 +296,13 @@ print(f"\n{SEP}")
 print("  FINAL RESULTS — test set")
 print(SEP)
 if c1: print(row("Case 1  rand-frozen  (baseline)", c1))
-if c2: print(row("Case 2  ssl-frozen   (linear probe)", c2))
-if c3: print(row("Case 3  ssl-frozen-mlp (MLP probe)", c3))
+if c2: print(row("Case 2  simclr-linear (linear probe)", c2))
+if c3: print(row("Case 3  simclr-mlp    (MLP probe)", c3))
 
 if pt:
-    print(f"\n  AugPred pretrain  best_val_loss={pt.get('best_val_loss','?'):.5f}  "
-          f"best_epoch={pt.get('best_epoch','?')}")
+    print(f"\n  SimCLR pretrain  best_val_loss={pt.get('best_val_loss','?'):.5f}  "
+          f"best_val_nt_acc={pt.get('best_val_nt_acc', '?')}  "
+          f"best_epoch={pt.get('best_epoch', '?')}")
 
 if c1 and c2:
     print(f"\n  SSL benefit   (C2 − C1) : "

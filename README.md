@@ -2,7 +2,7 @@
 
 Monorepo layout:
 
-- **`snn_ssl_wisdm/`** — Spiking ResNet + AugPred SSL + WISDM linear probing ([`snn_ssl_wisdm/README.md`](snn_ssl_wisdm/README.md)).
+- **`snn_ssl_wisdm/`** — Spiking ResNet + **SimCLR** SSL + WISDM frozen probing ([`snn_ssl_wisdm/README.md`](snn_ssl_wisdm/README.md)); AugPred script remains optional.
 - **`SpikeGPT/`** — SpikingJelly / reference SNN code (vendored for imports).
 - **`ssl-wearables/`** — Original Oxford SSL HAR codebase (reference / PYTHONPATH).
 - **`wisdm-dataset/`** — WISDM raw and ARFF data ([dataset README](wisdm-dataset/README.txt)).

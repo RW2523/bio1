@@ -7,8 +7,8 @@
 #
 # Cases run:
 #   Case 1 : random frozen backbone   + linear head  (baseline)
-#   Case 2 : AugPred-pretrained frozen + linear head (SSL benefit)
-#   Case 3 : AugPred-pretrained frozen backbone + MLP head (non-linear probe)
+#   Case 2 : SimCLR-pretrained frozen + linear head (SSL benefit)
+#   Case 3 : SimCLR-pretrained frozen backbone + MLP head (non-linear probe)
 # -----------------------------------------------------------------------------
 set -euo pipefail
 
@@ -55,27 +55,27 @@ python -m snn_ssl_wisdm.scripts.linear_probe_snn \
   --case case1 \
   --epochs "$EP_L"
 
-# ── AugPred self-supervised pretraining ────────────────────────────────────
+# ── SimCLR contrastive pretraining ─────────────────────────────────────────
 echo ""
-echo "== AugPred SSL pretraining"
-python -m snn_ssl_wisdm.scripts.pretrain_augpred_snn \
+echo "== SimCLR SSL pretraining"
+python -m snn_ssl_wisdm.scripts.pretrain_simclr_snn \
   --config snn_ssl_wisdm/configs/default.yaml \
   --epochs "$EP_P"
 
-PRETRAINED="outputs/augpred_pretrain_snn/best_backbone.pt"
+PRETRAINED="outputs/simclr_pretrain_snn/best_backbone.pt"
 
-# ── Case 2: AugPred-pretrained frozen backbone + linear head ─────────────
+# ── Case 2: SimCLR-pretrained frozen backbone + linear head ───────────────
 echo ""
-echo "== Case 2: AugPred-pretrained frozen backbone + linear head"
+echo "== Case 2: SimCLR-pretrained frozen backbone + linear head"
 python -m snn_ssl_wisdm.scripts.linear_probe_snn \
   --config snn_ssl_wisdm/configs/default.yaml \
   --case case2 \
   --pretrained "$PRETRAINED" \
   --epochs "$EP_L"
 
-# ── Case 3: AugPred-pretrained frozen backbone + MLP head ──────────────────
+# ── Case 3: SimCLR-pretrained frozen backbone + MLP head ──────────────────
 echo ""
-echo "== Case 3: frozen backbone + MLP head (SSL init, train head only)"
+echo "== Case 3: frozen backbone + MLP head (SimCLR init, train head only)"
 python -m snn_ssl_wisdm.scripts.linear_probe_snn \
   --config snn_ssl_wisdm/configs/default.yaml \
   --case case3 \
@@ -90,10 +90,10 @@ python -m snn_ssl_wisdm.scripts.evaluate \
   --run outputs/case1_random_frozen || true
 python -m snn_ssl_wisdm.scripts.evaluate \
   --config snn_ssl_wisdm/configs/default.yaml \
-  --run outputs/case2_augpred_frozen || true
+  --run outputs/case2_simclr_frozen || true
 python -m snn_ssl_wisdm.scripts.evaluate \
   --config snn_ssl_wisdm/configs/default.yaml \
-  --run outputs/case3_augpred_frozen_mlp || true
+  --run outputs/case3_simclr_frozen_mlp || true
 
 echo ""
 echo "== Plot aggregate"
@@ -114,8 +114,8 @@ def loadm(p):
         return json.load(fp)
 
 c1 = loadm("case1_random_frozen")
-c2 = loadm("case2_augpred_frozen")
-c3 = loadm("case3_augpred_frozen_mlp")
+c2 = loadm("case2_simclr_frozen")
+c3 = loadm("case3_simclr_frozen_mlp")
 
 def row(tag, d):
     bacc = d.get("balanced_accuracy", 0)
@@ -126,11 +126,11 @@ def row(tag, d):
     )
 
 print("\n" + "="*75)
-print("   FINAL COMPARISON — test set")
+print("   FINAL COMPARISON — test set (SimCLR SSL)")
 print("="*75)
 if c1: print(row("Case1 (rand-frz)",  c1))
-if c2: print(row("Case2 (ssl-frz)",   c2))
-if c3: print(row("Case3 (ssl-mlp)",  c3))
+if c2: print(row("Case2 (simclr)",   c2))
+if c3: print(row("Case3 (simclr-mlp)", c3))
 if c1 and c2:
     delta_acc = c2['accuracy'] - c1['accuracy']
     print(f"\n  SSL benefit (C2-C1): Δacc={delta_acc:+.4f}  Δmacro_f1={c2['macro_f1']-c1['macro_f1']:+.4f}")

@@ -52,6 +52,26 @@ class MLPClassifierHead(nn.Module):
         return self.net(x)
 
 
+class SimCLRProjector(nn.Module):
+    """2-layer MLP projector for SimCLR (Chen et al.) on backbone features.
+
+    Maps representation ``[B, in_dim]`` → latent ``[B, out_dim]`` (L2-normalised
+    outside this module in the training loop).
+    """
+
+    def __init__(self, in_dim: int, hidden_dim: int = 2048, out_dim: int = 128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim, bias=False),
+            nn.BatchNorm1d(hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, out_dim, bias=True),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
 class AugPredHeads(nn.Module):
     """Four SSL prediction heads for AugPred pretraining.
 

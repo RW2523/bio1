@@ -3,8 +3,8 @@
 Three experimental cases
 ------------------------
 case1 : Randomly-initialised, frozen backbone  + linear head   (baseline)
-case2 : AugPred-pretrained,   frozen backbone  + linear head   (SSL benefit)
-case3 : AugPred-pretrained,   frozen backbone  + MLP head      (non-linear probe on SSL features)
+case2 : SimCLR-pretrained,    frozen backbone  + linear head   (SSL benefit)
+case3 : SimCLR-pretrained,    frozen backbone  + MLP head      (non-linear probe on SSL features)
 
 All cases keep the backbone frozen. Case 3 only trains the MLP classifier on top of fixed
 representations. During training, the backbone stays in ``eval()`` so BatchNorm uses
@@ -199,7 +199,7 @@ def main():
     ap.add_argument("--config",         type=str, required=True)
     ap.add_argument("--case",           type=str, choices=["case1", "case2", "case3"], required=True)
     ap.add_argument("--pretrained",     type=str, default=None,
-                    help="Path to best_backbone.pt from AugPred pretrain (required for case2/case3).")
+                    help="Path to best_backbone.pt from SimCLR (or AugPred) pretrain (required for case2/case3).")
     ap.add_argument("--epochs",         type=int, default=None)
     ap.add_argument("--limit_subjects", type=int, default=None)
     ap.add_argument("--max_windows",    type=int, default=None)
@@ -366,8 +366,8 @@ def main():
     # ── output dir ────────────────────────────────────────────────────────
     out_name = {
         "case1": "case1_random_frozen",
-        "case2": "case2_augpred_frozen",
-        "case3": "case3_augpred_frozen_mlp",
+        "case2": "case2_simclr_frozen",
+        "case3": "case3_simclr_frozen_mlp",
     }[args.case]
     out_dir  = Path(cfg["output_root"]) / out_name
     out_dir.mkdir(parents=True, exist_ok=True)

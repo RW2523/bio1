@@ -14,14 +14,15 @@ num_workers: 4
 # ── training ──────────────────────────────────────────────────────────────
 epochs_linear_probe: 150      # Cases 1 & 2 (frozen backbone + linear head)
 epochs_case3_mlp: 150         # Case 3 (frozen backbone + MLP head)
-epochs_pretrain: 300          # AugPred SSL (longer → richer frozen features)
+epochs_pretrain: 300          # SimCLR contrastive pretrain
 patience: 22                  # default early-stop (overridden by probe.patience)
 patience_pretrain: 45        # SSL patience
 min_epochs_pretrain: 50      # never stop SSL before this many epochs
 
 lr_head: 4.0e-3               # Cases 1 & 2 linear head LR
 lr_case3_mlp: 4.0e-3          # Case 3 MLP head LR
-lr_pretrain: 8.0e-4          # AugPred LR (slightly higher with input noise)
+lr_pretrain: 5.0e-4          # legacy key; SimCLR uses lr_simclr
+lr_simclr: 5.0e-4           # SimCLR AdamW LR (projector + backbone)
 weight_decay: 1.0e-4
 grad_clip: 1.0
 amp: true
@@ -68,8 +69,22 @@ head:
 # ── output ─────────────────────────────────────────────────────────────────
 output_root: outputs
 
-# ── augpred SSL ────────────────────────────────────────────────────────────
+# ── SimCLR contrastive SSL (replaces AugPred in the default pipeline) ───────
+simclr:
+  temperature: 0.15           # NT-Xent temperature (lower = sharper)
+  projector_hidden: 2048
+  projector_out: 128
+  aug_noise_std: 0.085        # Gaussian noise (train views)
+  aug_scale_lo: 0.72
+  aug_scale_hi: 1.32
+  aug_reverse_prob: 0.5
+  aug_time_warp_prob: 0.55
+  aug_time_warp_strength: 0.22
+  aug_channel_drop_prob: 0.12
+  val_noise_std: 0.012        # tiny noise for val views (two weak augmentations)
+
+# Optional: AugPred script ``pretrain_augpred_snn.py`` still reads ``augpred:`` if you switch back.
 augpred:
   num_perm_chunks: 4
   time_warp_strength: 0.22
-  input_noise_std: 0.028      # Gaussian on raw batch before pretext transforms (train)
+  input_noise_std: 0.028
