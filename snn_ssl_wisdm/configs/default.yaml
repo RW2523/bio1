@@ -58,6 +58,9 @@ probe:
   tta_noise_std: 0.018        # noise std for extra TTA views
   min_epochs: 22              # early-stop guard
   patience: 28                # early-stop patience (val balanced accuracy)
+  # Class weights in CE already reweight loss; uniform shuffle often generalises better.
+  use_weighted_sampler: false
+  cosine_eta_min_ratio: 0.04 # cosine tail floor (fraction of peak LR after warm-up)
 
 # ── case3: frozen backbone + deeper MLP head ────────────────────────────────
 head:
@@ -82,6 +85,10 @@ simclr:
   aug_time_warp_strength: 0.22
   aug_channel_drop_prob: 0.12
   val_noise_std: 0.012        # tiny noise for val views (two weak augmentations)
+  use_weighted_sampler: false # keep negative diversity for NT-Xent
+  weight_decay_backbone: 1.0e-4
+  weight_decay_projector: 1.0e-6
+  cosine_eta_min_ratio: 0.05  # cosine LR floor (fraction of base LR)
 
 # Optional: AugPred script ``pretrain_augpred_snn.py`` still reads ``augpred:`` if you switch back.
 augpred:

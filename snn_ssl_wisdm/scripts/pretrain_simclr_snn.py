@@ -1,8 +1,13 @@
 """SimCLR-style contrastive pretraining (Chen et al., 2020) for spiking ResNet on WISDM.
 
-Two stochastic views per window, NT-Xent loss on L2-normalised projector outputs.
-Saves only the backbone weights to ``outputs/simclr_pretrain_snn/best_backbone.pt``
-for Case 2 / Case 3 linear or MLP probing (projector is discarded downstream).
+Two stochastic views per window, NT-Xent on L2-normalised projector outputs.
+
+Training defaults:
+  - **Uniform shuffled batches** (not movement-weighted sampling): contrastive negatives
+    must be diverse across the dataset; weighted sampling collapses negative diversity.
+  - ``drop_last=True`` so every training step has a full batch (stable NT-Xent).
+  - **Checkpoint by validation contrastive accuracy** (primary), val loss as tie-breaker.
+  - **Separate AdamW weight decay** for backbone vs projector (SimCLR-style: low WD on projector).
 """
 
 from __future__ import annotations
@@ -10,7 +15,7 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -44,9 +49,7 @@ def nt_xent_loss(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> torc
     z2 = F.normalize(z2, dim=1, eps=1e-8)
     z = torch.cat([z1, z2], dim=0)
     logits = torch.mm(z, z.t()) / temperature
-    # Mask self-similarities (diagonal). Use finite negative for AMP stability.
     logits = logits.masked_fill(torch.eye(2 * B, device=z.device, dtype=torch.bool), -1e4)
-    # Row i positive column: i+B if i < B else i-B
     labels = torch.cat([torch.arange(B, device=z.device) + B, torch.arange(B, device=z.device)], dim=0)
     return F.cross_entropy(logits, labels)
 
@@ -64,12 +67,8 @@ def nt_xent_accuracy(z1: torch.Tensor, z2: torch.Tensor, temperature: float) -> 
 
 
 def simclr_augment(x: torch.Tensor, sc: Dict, training: bool) -> torch.Tensor:
-    """Stochastic augmentations for 1D IMU windows [B, C, T].
-
-    Training uses strong augmentations; validation uses only tiny Gaussian noise
-    so two views stay stable but not identical.
-    """
-    out = x
+    """Per-sample stochastic augmentations for 1D IMU windows [B, C, T]."""
+    out = x.clone()
     B, C, T = out.shape
     device, dtype = out.device, out.dtype
 
@@ -91,15 +90,24 @@ def simclr_augment(x: torch.Tensor, sc: Dict, training: bool) -> torch.Tensor:
         mask = (torch.rand(B, C, 1, device=device) > p_drop).to(dtype)
         out = out * mask
 
-    if torch.rand(1, device=device).item() < float(sc.get("aug_reverse_prob", 0.5)):
-        out = out.flip(-1)
+    p_rev = float(sc.get("aug_reverse_prob", 0.5))
+    if p_rev > 0:
+        rev = torch.rand(B, device=device) < p_rev
+        if rev.any():
+            out[rev] = out[rev].flip(-1)
 
-    if torch.rand(1, device=device).item() < float(sc.get("aug_time_warp_prob", 0.5)):
-        strength = float(sc.get("aug_time_warp_strength", 0.22))
-        fac = 1.0 + (torch.rand(1, device=device).item() * 2.0 - 1.0) * strength
-        nl = max(8, int(round(T * fac)))
-        out = F.interpolate(out, size=nl, mode="linear", align_corners=False)
-        out = F.interpolate(out, size=T, mode="linear", align_corners=False)
+    p_tw = float(sc.get("aug_time_warp_prob", 0.5))
+    strength = float(sc.get("aug_time_warp_strength", 0.22))
+    if p_tw > 0 and strength > 0:
+        tw_m = torch.rand(B, device=device) < p_tw
+        idxs = tw_m.nonzero(as_tuple=False).view(-1)
+        for b in idxs.tolist():
+            fac = 1.0 + (torch.rand(1, device=device, dtype=dtype).item() * 2.0 - 1.0) * strength
+            nl = max(8, int(round(T * fac)))
+            w = out[b : b + 1]
+            w = F.interpolate(w, size=nl, mode="linear", align_corners=False)
+            w = F.interpolate(w, size=T, mode="linear", align_corners=False)
+            out[b] = w.squeeze(0)
 
     return out
 
@@ -141,6 +149,10 @@ def main():
     temperature = float(sc.get("temperature", 0.15))
     proj_h = int(sc.get("projector_hidden", 2048))
     proj_d = int(sc.get("projector_out", 128))
+    use_weighted = bool(sc.get("use_weighted_sampler", False))
+    wd_bb = float(sc.get("weight_decay_backbone", cfg.get("weight_decay", 1e-4)))
+    wd_proj = float(sc.get("weight_decay_projector", 1e-6))
+    eta_min_ratio = float(sc.get("cosine_eta_min_ratio", 0.05))
 
     subj_np = subjects.numpy()
     train_idx = np.where(mask_for_subjects(subj_np, "train", split))[0]
@@ -148,14 +160,32 @@ def main():
 
     ds_tr = WISDMDataset(processed, train_idx)
     ds_va = WISDMDataset(processed, val_idx)
-    w_train = weights[train_idx].float()
-    sampler = WeightedRandomSampler(w_train, num_samples=len(w_train), replacement=True)
 
     nw = int(cfg["num_workers"])
     bs = int(cfg["batch_size"])
-    train_loader = DataLoader(
-        ds_tr, batch_size=bs, sampler=sampler, num_workers=nw, pin_memory=device.type == "cuda"
-    )
+
+    if use_weighted:
+        w_train = weights[train_idx].float()
+        sampler = WeightedRandomSampler(w_train, num_samples=len(w_train), replacement=True)
+        train_loader = DataLoader(
+            ds_tr,
+            batch_size=bs,
+            sampler=sampler,
+            num_workers=nw,
+            pin_memory=device.type == "cuda",
+            drop_last=True,
+        )
+        print("[simclr] WARNING: use_weighted_sampler=true — negatives may be less diverse.")
+    else:
+        train_loader = DataLoader(
+            ds_tr,
+            batch_size=bs,
+            shuffle=True,
+            num_workers=nw,
+            pin_memory=device.type == "cuda",
+            drop_last=True,
+        )
+
     val_loader = DataLoader(
         ds_va, batch_size=bs, shuffle=False, num_workers=nw, pin_memory=device.type == "cuda"
     )
@@ -180,9 +210,11 @@ def main():
 
     lr = float(cfg.get("lr_simclr", cfg.get("lr_pretrain", 5e-4)))
     opt = torch.optim.AdamW(
-        list(backbone.parameters()) + list(projector.parameters()),
+        [
+            {"params": list(backbone.parameters()), "weight_decay": wd_bb},
+            {"params": list(projector.parameters()), "weight_decay": wd_proj},
+        ],
         lr=lr,
-        weight_decay=float(cfg["weight_decay"]),
     )
 
     epochs = int(cfg.get("epochs_pretrain") or 300)
@@ -198,7 +230,8 @@ def main():
         if ep < warmup_epochs:
             return (ep + 1) / max(1, warmup_epochs)
         progress = (ep - warmup_epochs) / max(1, epochs - warmup_epochs)
-        return 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159265)).item())
+        cos = 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159265)).item())
+        return eta_min_ratio + (1.0 - eta_min_ratio) * cos
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
 
@@ -206,8 +239,8 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     log_path = out_dir / "train_log.csv"
     rows: List[Dict] = []
-    best_val = float("inf")
-    best_score = -1.0
+    # Lexicographic: maximise val_nt_acc, then minimise val_loss (via tuple compare).
+    best_key: Tuple[float, float] = (-1.0, float("inf"))
     stall = 0
     best_sd = None
 
@@ -290,10 +323,12 @@ def main():
             w.writeheader()
             w.writerows(rows)
 
-        improved = va_loss < best_val - 1e-6
-        if improved:
-            best_val = va_loss
-            best_score = va_acc
+        key = (va_acc, -va_loss)
+        old_acc, old_loss = best_key
+        best_cmp = (old_acc, -old_loss)
+        if key > best_cmp:
+            reason = "val_nt_acc" if va_acc > old_acc + 1e-8 else "val_loss_tiebreak"
+            best_key = (va_acc, va_loss)
             stall = 0
             best_sd = {
                 "backbone": {k: v.cpu() for k, v in backbone.state_dict().items()},
@@ -301,6 +336,7 @@ def main():
                 "epoch": epoch,
                 "val_loss": float(va_loss),
                 "val_nt_acc": float(va_acc),
+                "selection": reason,
             }
             torch.save({"backbone": best_sd["backbone"]}, out_dir / "best_backbone.pt")
         else:
@@ -308,7 +344,7 @@ def main():
             if epoch >= min_epochs and stall >= patience:
                 print(
                     f"Early stopping SimCLR at epoch {epoch}  "
-                    f"(best_val_loss={best_val:.5f}, best_val_nt_acc={best_score:.4f})"
+                    f"(best_val_nt_acc={best_key[0]:.4f}, best_val_loss={best_key[1]:.5f})"
                 )
                 break
 
@@ -319,12 +355,14 @@ def main():
     save_json(
         out_dir / "metrics.json",
         {
-            "best_val_loss": float(best_val),
-            "best_val_nt_acc": float(best_score),
+            "best_val_loss": float(best_key[1]) if best_key[1] < float("inf") else -1.0,
+            "best_val_nt_acc": float(best_key[0]),
             "best_epoch": int(best_sd["epoch"]) if best_sd else -1,
+            "selection": best_sd.get("selection", "") if best_sd else "",
             "temperature": temperature,
             "projector_hidden": proj_h,
             "projector_out": proj_d,
+            "use_weighted_sampler": use_weighted,
             "meta": meta,
         },
     )

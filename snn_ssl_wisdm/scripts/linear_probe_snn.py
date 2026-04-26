@@ -250,12 +250,25 @@ def main():
 
     nw  = int(cfg["num_workers"])
     bs  = int(cfg["batch_size"])
+    probe_early = cfg.get("probe") or {}
+    use_probe_wsampler = bool(probe_early.get("use_weighted_sampler", False))
 
-    sw_train = _sample_weights(labels, train_idx, num_classes)
-    sampler  = WeightedRandomSampler(sw_train, num_samples=len(sw_train), replacement=True)
-
-    train_loader = DataLoader(ds_tr, batch_size=bs, sampler=sampler,
-                              num_workers=nw, pin_memory=device.type == "cuda")
+    if use_probe_wsampler:
+        sw_train = _sample_weights(labels, train_idx, num_classes)
+        sampler = WeightedRandomSampler(sw_train, num_samples=len(sw_train), replacement=True)
+        train_loader = DataLoader(
+            ds_tr, batch_size=bs, sampler=sampler, num_workers=nw, pin_memory=device.type == "cuda"
+        )
+        print("[probe] train: WeightedRandomSampler (inverse class frequency)")
+    else:
+        train_loader = DataLoader(
+            ds_tr,
+            batch_size=bs,
+            shuffle=True,
+            num_workers=nw,
+            pin_memory=device.type == "cuda",
+        )
+        print("[probe] train: uniform shuffle (class imbalance handled by CE weights)")
     val_loader   = DataLoader(ds_va, batch_size=bs, shuffle=False,
                               num_workers=nw, pin_memory=device.type == "cuda")
     test_loader  = DataLoader(ds_te, batch_size=bs, shuffle=False,
@@ -313,7 +326,7 @@ def main():
     else:
         print(f"[{args.case}] Backbone FROZEN — train linear head only")
 
-    probe = cfg.get("probe") or {}
+    probe = probe_early
     ls = float(probe.get("label_smoothing", 0.0))
     train_noise = float(probe.get("train_noise_std", 0.0))
     mixup_alpha = float(probe.get("mixup_alpha", 0.0))
@@ -354,13 +367,17 @@ def main():
         weight_decay=float(cfg["weight_decay"]),
     )
 
-    # Cosine annealing with 5-epoch warm-up
+    # Cosine annealing with warm-up; optional floor so LR does not hit exactly zero.
     warmup = min(5, epochs // 10)
+    eta_min_r = float(probe.get("cosine_eta_min_ratio", 0.04))
+
     def lr_lambda(ep):
         if ep < warmup:
             return (ep + 1) / max(1, warmup)
         progress = (ep - warmup) / max(1, epochs - warmup)
-        return 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159265)).item())
+        cos = 0.5 * (1.0 + torch.cos(torch.tensor(progress * 3.14159265)).item())
+        return eta_min_r + (1.0 - eta_min_r) * cos
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # ── output dir ────────────────────────────────────────────────────────
@@ -457,6 +474,8 @@ def main():
         "tta_noise_std": tta_noise,
         "min_epochs": min_epochs,
         "patience": patience,
+        "use_weighted_sampler": use_probe_wsampler,
+        "cosine_eta_min_ratio": eta_min_r,
     }
     save_json(out_dir / "metrics.json", metrics)
     print(
