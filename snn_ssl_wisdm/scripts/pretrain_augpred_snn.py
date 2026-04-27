@@ -32,7 +32,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, WeightedRandomSampler
 
 from snn_ssl_wisdm.amp_utils import amp_scaler_and_autocast
-from snn_ssl_wisdm.data.splits import load_split_json, mask_for_subjects
+from snn_ssl_wisdm.data.splits import load_split_payload, train_val_test_indices
 from snn_ssl_wisdm.data.wisdm import WISDMDataset
 from snn_ssl_wisdm.models.heads import AugPredHeads
 from snn_ssl_wisdm.models.spiking_resnet1d import SpikingResNet1DBackbone
@@ -147,6 +147,7 @@ def main():
     ap.add_argument("--epochs",          type=int, default=None)
     ap.add_argument("--limit_subjects",  type=int, default=None)
     ap.add_argument("--max_windows",     type=int, default=None)
+    ap.add_argument("--split", type=str, choices=["subject", "window"], default=None)
     args = ap.parse_args()
 
     cfg_path = Path(args.config)
@@ -170,7 +171,16 @@ def main():
     print_gpu_info(device)
 
     processed = Path(cfg["processed_path"])
-    split, _  = load_split_json(Path(cfg["splits_path"]))
+    data_cfg = cfg.get("data") or {}
+    split_mode = args.split or data_cfg.get("evaluation_split", "subject")
+    split_path = (
+        Path(cfg["splits_path"])
+        if split_mode == "subject"
+        else Path(cfg.get("splits_window_path", "snn_ssl_wisdm/processed/splits_window_seed42.json"))
+    )
+    if not split_path.is_absolute():
+        split_path = (workspace_root() / split_path).resolve()
+    payload = load_split_payload(split_path)
     bundle    = torch_load(processed, map_location="cpu")
     subjects  = bundle["subjects"]
     weights   = bundle["sample_weights"]
@@ -179,17 +189,20 @@ def main():
     n_chunks  = int(ap_cfg.get("num_perm_chunks", 4))
     tw_strength = float(ap_cfg.get("time_warp_strength", 0.20))
     in_noise   = float(ap_cfg.get("input_noise_std", 0.0))
-    T = int(bundle["windows"].shape[2])
+    w_any = bundle.get("windows_raw") or bundle["windows"]
+    T = int(w_any.shape[2])
     assert T % n_chunks == 0, (
         f"Window length T={T} must be divisible by augpred.num_perm_chunks={n_chunks}"
     )
 
     subj_np   = subjects.numpy()
-    train_idx = np.where(mask_for_subjects(subj_np, "train", split))[0]
-    val_idx   = np.where(mask_for_subjects(subj_np, "val",   split))[0]
+    train_idx, val_idx, _te = train_val_test_indices(payload, subj_np)
+    norm_mode = data_cfg.get("norm_mode")
+    if norm_mode is None:
+        norm_mode = "window" if split_mode == "window" else "subject"
 
-    ds_tr = WISDMDataset(processed, train_idx)
-    ds_va = WISDMDataset(processed, val_idx)
+    ds_tr = WISDMDataset(processed, train_idx, norm_mode=norm_mode)
+    ds_va = WISDMDataset(processed, val_idx, norm_mode=norm_mode)
     w_train = weights[train_idx].float()
     sampler = WeightedRandomSampler(w_train, num_samples=len(w_train), replacement=True)
 
@@ -215,14 +228,19 @@ def main():
         beta          = float(sch["beta"]),
         v_threshold   = float(sch["threshold"]),
         detach_reset  = bool(sch["detach_reset"]),
+        decay_input   = bool(sch.get("decay_input", False)),
+        soft_reset    = bool(sch.get("soft_reset", True)),
     ).to(device)
     heads = AugPredHeads(int(mcfg["feature_dim"]), n_rotations=n_chunks).to(device)
 
-    opt = torch.optim.AdamW(
-        list(backbone.parameters()) + list(heads.parameters()),
-        lr=float(cfg["lr_pretrain"]),
-        weight_decay=float(cfg["weight_decay"]),
-    )
+    ap_optim = cfg.get("augpred", {}) or {}
+    lr_pt = float(cfg.get("lr_pretrain", 1e-3))
+    wd = float(cfg["weight_decay"])
+    params = list(backbone.parameters()) + list(heads.parameters())
+    if bool(ap_optim.get("use_adamw", False)):
+        opt = torch.optim.AdamW(params, lr=lr_pt, weight_decay=wd)
+    else:
+        opt = torch.optim.Adam(params, lr=lr_pt, weight_decay=wd)
 
     epochs       = int(cfg.get("epochs_pretrain") or 200)
     patience     = int(cfg.get("patience_pretrain") or cfg.get("patience") or 30)

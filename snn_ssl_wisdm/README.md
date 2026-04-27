@@ -1,6 +1,8 @@
 # snn_ssl_wisdm
 
-Integration pipeline: **WISDM** raw sensor windows → **spiking 1D ResNet** (SpikingJelly-style LIF from `SpikeGPT/src/spikingjelly`) → **SimCLR contrastive pretraining** (NT-Xent on two augmented views) → **frozen-backbone probing** (linear for Case 2, MLP for Case 3).
+Integration pipeline: **WISDM** raw sensor windows → **spiking 1D ResNet** (Conv1d blocks, SpikingJelly-style LIF with **soft reset** and **DC / decay_input=false** drive) → optional **SimCLR** pretrain → **frozen-backbone** linear / MLP probes.
+
+Default data path (**`data.fused_12ch: true`** in `configs/default.yaml`): **12 channels** = phone accel xyz + phone gyro xyz + watch accel xyz + watch gyro xyz, aligned on the **watch accel timeline** (6.4 s @ 20 Hz → **128** samples, stride **64**). Windows are taken only inside **single-activity** segments. The `.pt` bundle stores **raw** windows plus **subject-train** and **window-train** normalisation tensors; `WISDMDataset` applies z-score per `norm_mode` / split. **Subject-disjoint** splits are primary (`splits_path`); **random window** indices for paper-style comparison live in `splits_window_path` — train with `--split window` (outputs go to `*_window` subdirs for probes).
 
 The older **AugPred** multi-task script (`pretrain_augpred_snn.py`) is still available if you switch the pipeline back and set checkpoint paths accordingly.
 

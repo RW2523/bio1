@@ -26,14 +26,15 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, WeightedRandomSampler
-from sklearn.metrics import balanced_accuracy_score
+from sklearn.metrics import balanced_accuracy_score, f1_score
 
 from snn_ssl_wisdm.amp_utils import amp_scaler_and_autocast
-from snn_ssl_wisdm.data.splits import load_split_json, mask_for_subjects
+from snn_ssl_wisdm.data.splits import load_split_payload, train_val_test_indices
 from snn_ssl_wisdm.data.wisdm import WISDMDataset
 from snn_ssl_wisdm.metrics import compute_metrics
 from snn_ssl_wisdm.models.heads import LinearClassifierHead, MLPClassifierHead
 from snn_ssl_wisdm.models.spiking_resnet1d import SpikingResNet1DBackbone
+from snn_ssl_wisdm.runtime_stats import forward_latency_ms, lif_mean_output_rate
 from snn_ssl_wisdm.torch_io import torch_load
 from snn_ssl_wisdm.train_utils import (
     load_yaml,
@@ -160,7 +161,12 @@ def _run_epoch(
             n += bs
     bacc = balanced_accuracy_score(all_y, all_p) if len(all_y) > 0 else 0.0
     acc  = np.mean(np.array(all_y) == np.array(all_p)) if len(all_y) > 0 else 0.0
-    return tot_loss / max(1, n), float(acc), float(bacc)
+    macro_f1 = (
+        float(f1_score(all_y, all_p, average="macro", zero_division=0))
+        if len(all_y) > 0
+        else 0.0
+    )
+    return tot_loss / max(1, n), float(acc), float(bacc), float(macro_f1)
 
 
 @torch.no_grad()
@@ -203,6 +209,13 @@ def main():
     ap.add_argument("--epochs",         type=int, default=None)
     ap.add_argument("--limit_subjects", type=int, default=None)
     ap.add_argument("--max_windows",    type=int, default=None)
+    ap.add_argument(
+        "--split",
+        type=str,
+        choices=["subject", "window"],
+        default=None,
+        help="subject = disjoint subjects (primary); window = random window split (paper comparison).",
+    )
     args = ap.parse_args()
 
     cfg_path = Path(args.config)
@@ -230,23 +243,34 @@ def main():
 
     # ── data ──────────────────────────────────────────────────────────────
     processed = Path(cfg["processed_path"])
-    split, _  = load_split_json(Path(cfg["splits_path"]))
     bundle    = torch_load(processed, map_location="cpu")
-    windows: torch.Tensor = bundle["windows"]
     labels:  torch.Tensor = bundle["labels"]
     subjects: torch.Tensor = bundle["subjects"]
     num_classes = int(cfg["num_classes"])
     assert int(labels.max()) < num_classes, "label out of range"
     print(f"Random-chance baseline: {1.0/num_classes:.4f} ({num_classes} classes)")
 
-    subj_np   = subjects.numpy()
-    train_idx = np.where(mask_for_subjects(subj_np, "train", split))[0]
-    val_idx   = np.where(mask_for_subjects(subj_np, "val",   split))[0]
-    test_idx  = np.where(mask_for_subjects(subj_np, "test",  split))[0]
+    data_cfg = cfg.get("data") or {}
+    split_mode = args.split or data_cfg.get("evaluation_split", "subject")
+    split_path = (
+        Path(cfg["splits_path"])
+        if split_mode == "subject"
+        else Path(cfg.get("splits_window_path", "snn_ssl_wisdm/processed/splits_window_seed42.json"))
+    )
+    if not split_path.is_absolute():
+        split_path = (workspace_root() / split_path).resolve()
+    payload = load_split_payload(split_path)
+    subj_np = subjects.numpy()
+    train_idx, val_idx, test_idx = train_val_test_indices(payload, subj_np)
+    print(f"[probe] split={split_mode}  file={split_path}  train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
 
-    ds_tr = WISDMDataset(processed, train_idx)
-    ds_va = WISDMDataset(processed, val_idx)
-    ds_te = WISDMDataset(processed, test_idx)
+    norm_mode = data_cfg.get("norm_mode")
+    if norm_mode is None:
+        norm_mode = "window" if split_mode == "window" else "subject"
+
+    ds_tr = WISDMDataset(processed, train_idx, norm_mode=norm_mode)
+    ds_va = WISDMDataset(processed, val_idx, norm_mode=norm_mode)
+    ds_te = WISDMDataset(processed, test_idx, norm_mode=norm_mode)
 
     nw  = int(cfg["num_workers"])
     bs  = int(cfg["batch_size"])
@@ -286,6 +310,8 @@ def main():
         beta          = float(sch["beta"]),
         v_threshold   = float(sch["threshold"]),
         detach_reset  = bool(sch["detach_reset"]),
+        decay_input   = bool(sch.get("decay_input", False)),
+        soft_reset    = bool(sch.get("soft_reset", True)),
     ).to(device)
 
     # Load pretrained backbone for case2 and case3
@@ -361,11 +387,11 @@ def main():
         epochs = int(cfg.get("epochs_linear_probe") or 100)
 
     patience = int(probe.get("patience", cfg.get("patience", 15)))
-    optimizer = torch.optim.AdamW(
-        head.parameters(),
-        lr=lr_head,
-        weight_decay=float(cfg["weight_decay"]),
-    )
+    wd = float(cfg["weight_decay"])
+    if bool(probe.get("use_adamw", False)):
+        optimizer = torch.optim.AdamW(head.parameters(), lr=lr_head, weight_decay=wd)
+    else:
+        optimizer = torch.optim.Adam(head.parameters(), lr=lr_head, weight_decay=wd)
 
     # Cosine annealing with warm-up; optional floor so LR does not hit exactly zero.
     warmup = min(5, epochs // 10)
@@ -386,27 +412,28 @@ def main():
         "case2": "case2_simclr_frozen",
         "case3": "case3_simclr_frozen_mlp",
     }[args.case]
-    out_dir  = Path(cfg["output_root"]) / out_name
+    split_suffix = "_window" if split_mode == "window" else ""
+    out_dir = Path(cfg["output_root"]) / f"{out_name}{split_suffix}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    best_val   = -float("inf")   # track val balanced-accuracy (higher = better)
+    best_key = (-1.0, -1.0)  # (val_macro_f1, val_bacc) lexicographic max
     stall      = 0
     best_state = None
     rows: List[Dict] = []
     log_path = out_dir / "train_log.csv"
 
     for epoch in range(1, epochs + 1):
-        tr_loss, tr_acc, tr_bacc = _run_epoch(
+        tr_loss, tr_acc, tr_bacc, tr_mf1 = _run_epoch(
             model, train_loader, device, criterion, optimizer,
             scaler, amp_ctx, True, grad_clip, frozen_bb,
             train_noise_std=train_noise, mixup_alpha=mixup_alpha,
         )
-        va_loss, va_acc, va_bacc = _run_epoch(
+        va_loss, va_acc, va_bacc, va_mf1 = _run_epoch(
             model, val_loader,   device, criterion, optimizer,
             scaler, amp_ctx, False, 0.0, frozen_bb,
             train_noise_std=0.0, mixup_alpha=0.0,
         )
-        te_loss, te_acc, te_bacc = _run_epoch(
+        te_loss, te_acc, te_bacc, te_mf1 = _run_epoch(
             model, test_loader,  device, criterion, optimizer,
             scaler, amp_ctx, False, 0.0, frozen_bb,
             train_noise_std=0.0, mixup_alpha=0.0,
@@ -416,15 +443,15 @@ def main():
 
         rows.append({
             "epoch": epoch,
-            "train_loss": tr_loss, "train_acc": tr_acc, "train_bacc": tr_bacc,
-            "val_loss":   va_loss, "val_acc":   va_acc, "val_bacc":   va_bacc,
-            "test_loss":  te_loss, "test_acc":  te_acc, "test_bacc":  te_bacc,
+            "train_loss": tr_loss, "train_acc": tr_acc, "train_bacc": tr_bacc, "train_macro_f1": tr_mf1,
+            "val_loss":   va_loss, "val_acc":   va_acc, "val_bacc":   va_bacc, "val_macro_f1": va_mf1,
+            "test_loss":  te_loss, "test_acc":  te_acc, "test_bacc":  te_bacc, "test_macro_f1": te_mf1,
             "lr": cur_lr,
         })
         print(
             f"epoch {epoch:03d}/{epochs}  [{args.case}]  "
-            f"tr_loss={tr_loss:.4f} tr_acc={tr_acc:.4f} tr_bacc={tr_bacc:.4f}  "
-            f"va_loss={va_loss:.4f} va_acc={va_acc:.4f} va_bacc={va_bacc:.4f}  "
+            f"tr_loss={tr_loss:.4f} tr_acc={tr_acc:.4f} tr_bacc={tr_bacc:.4f} tr_mf1={tr_mf1:.4f}  "
+            f"va_loss={va_loss:.4f} va_acc={va_acc:.4f} va_bacc={va_bacc:.4f} va_mf1={va_mf1:.4f}  "
             f"te_acc={te_acc:.4f}  lr={cur_lr:.2e}"
         )
         with open(log_path, "w", newline="", encoding="utf-8") as f:
@@ -432,20 +459,25 @@ def main():
             dw.writeheader()
             dw.writerows(rows)
 
-        # Early stopping on val balanced-accuracy (max)
-        if va_bacc > best_val + 1e-5:
-            best_val  = va_bacc
-            stall     = 0
+        key = (va_mf1, va_bacc)
+        if key > best_key:
+            best_key = key
+            stall = 0
             best_state = {
                 "backbone": {k: v.cpu() for k, v in backbone.state_dict().items()},
                 "head":     {k: v.cpu() for k, v in head.state_dict().items()},
                 "epoch":    epoch,
+                "val_macro_f1": float(va_mf1),
+                "val_bacc": float(va_bacc),
             }
             torch.save(best_state, out_dir / "best.pt")
         else:
             stall += 1
             if epoch >= min_epochs and stall >= patience:
-                print(f"Early stopping at epoch {epoch}  (best val_bacc={best_val:.4f})")
+                print(
+                    f"Early stopping at epoch {epoch}  "
+                    f"(best val_macro_f1={best_key[0]:.4f} val_bacc={best_key[1]:.4f})"
+                )
                 break
 
     # Restore best checkpoint
@@ -463,9 +495,23 @@ def main():
         tta_passes=tta_passes, tta_noise_std=tta_noise,
     )
     metrics = compute_metrics(y_true, y_pred, num_classes)
+    # Latency + spike activity (best checkpoint loaded above)
+    try:
+        batch0 = next(iter(test_loader))
+        xb = batch0["x"].to(device, non_blocking=True)
+        metrics["latency_ms_mean_forward"] = forward_latency_ms(model, xb, device)
+        metrics["mean_lif_output_rate"] = lif_mean_output_rate(backbone, xb)
+    except Exception as e:
+        metrics["latency_ms_mean_forward"] = -1.0
+        metrics["mean_lif_output_rate"] = -1.0
+        metrics["runtime_stats_error"] = str(e)
+
     metrics["case"]              = args.case
     metrics["random_baseline_acc"] = float(1.0 / num_classes)
-    metrics["best_val_bacc"]     = float(best_val)
+    metrics["best_val_macro_f1"] = float(best_key[0])
+    metrics["best_val_bacc"]     = float(best_key[1])
+    metrics["evaluation_split"] = split_mode
+    metrics["norm_mode"] = norm_mode
     metrics["probe_settings"] = {
         "label_smoothing": ls,
         "train_noise_std": train_noise,
@@ -476,6 +522,7 @@ def main():
         "patience": patience,
         "use_weighted_sampler": use_probe_wsampler,
         "cosine_eta_min_ratio": eta_min_r,
+        "use_adamw": bool(probe.get("use_adamw", False)),
     }
     save_json(out_dir / "metrics.json", metrics)
     print(

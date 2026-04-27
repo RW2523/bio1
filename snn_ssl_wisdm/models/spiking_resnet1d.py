@@ -60,9 +60,9 @@ class _SurrogateSpike(torch.autograd.Function):
 class FallbackLIF(nn.Module):
     """Stateful LIF with ATan surrogate gradient.
 
-    membrane equation (decay_input=False):
-        v[t] = v[t-1] * (1 - 1/tau) + x[t]
-    After a spike: hard reset to v_reset (detach optional).
+    Matches SpikingJelly ``LIFNode`` with ``decay_input=False`` (direct current / DC drive):
+    ``v = v * (1 - 1/tau) + x``. Reset is **soft** (subtract threshold after spike) or **hard**
+    (clamp to ``v_reset``).
     """
 
     def __init__(
@@ -71,6 +71,7 @@ class FallbackLIF(nn.Module):
         v_threshold: float = 1.0,
         v_reset: float = 0.0,
         detach_reset: bool = True,
+        soft_reset: bool = True,
     ):
         super().__init__()
         assert tau > 1.0, "tau must be > 1 for stable LIF dynamics"
@@ -78,21 +79,23 @@ class FallbackLIF(nn.Module):
         self.v_threshold = v_threshold
         self.v_reset = v_reset
         self.detach_reset = detach_reset
+        self.soft_reset = soft_reset
         self.v: Optional[torch.Tensor] = None
 
     def reset(self):
         self.v = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        init_v = 0.0 if self.soft_reset else self.v_reset
         if self.v is None or self.v.shape != x.shape:
-            self.v = torch.full_like(x, self.v_reset)
-        # Leaky integration matching SpikingJelly clock_driven convention:
-        #   v[t] = v[t-1] * (1 - 1/tau) + x[t] / tau
-        # With tau=2 this gives v += 0.5*x; threshold=0.5 → ~16% firing on N(0,1).
-        self.v = self.v * (1.0 - 1.0 / self.tau) + x / self.tau
+            self.v = torch.full_like(x, init_v)
+        self.v = self.v * (1.0 - 1.0 / self.tau) + x
         spike = _SurrogateSpike.apply(self.v - self.v_threshold, 2.0)
         sd = spike.detach() if self.detach_reset else spike
-        self.v = (1.0 - sd) * self.v + sd * self.v_reset
+        if self.soft_reset:
+            self.v = self.v - sd * self.v_threshold
+        else:
+            self.v = (1.0 - sd) * self.v + sd * self.v_reset
         return spike
 
 
@@ -172,6 +175,8 @@ class SpikingResNet1DBackbone(nn.Module):
         beta: float = 0.9,        # tau = 1/(1-beta); 0.9 → tau=10 (slow decay, good temporal memory)
         v_threshold: float = 1.0,
         detach_reset: bool = True,
+        decay_input: bool = False,
+        soft_reset: bool = True,
     ):
         super().__init__()
         if layers is None:
@@ -189,7 +194,9 @@ class SpikingResNet1DBackbone(nn.Module):
             def lif_factory():
                 return lif_cls(
                     tau=tau,
+                    decay_input=decay_input,
                     v_threshold=v_threshold,
+                    v_reset=None if soft_reset else 0.0,
                     surrogate_function=atan_sf(),
                     detach_reset=detach_reset,
                 )
@@ -201,6 +208,7 @@ class SpikingResNet1DBackbone(nn.Module):
                     v_threshold=v_threshold,
                     v_reset=0.0,
                     detach_reset=detach_reset,
+                    soft_reset=soft_reset,
                 )
             self._reset_net = lambda m: _fallback_reset_net(m)
 

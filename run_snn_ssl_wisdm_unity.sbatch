@@ -178,9 +178,9 @@ echo "All required folders present."
 # --smoke flag from the CLI if you want a quick sanity check locally).
 # These match the values in snn_ssl_wisdm/configs/default.yaml.
 # =============================================================================
-EP_P=300    # epochs_pretrain  (SimCLR; matches default.yaml)
-EP_L=150    # epochs_linear_probe (Cases 1 & 2)
-EP_F=150    # epochs_case3_mlp  (Case 3: frozen backbone + MLP head)
+EP_P=60     # epochs_pretrain  (SimCLR; matches default.yaml)
+EP_L=60     # epochs_linear_probe (Cases 1 & 2)
+EP_F=60     # epochs_case3_mlp  (Case 3: frozen backbone + MLP head)
 PRETRAINED="outputs/simclr_pretrain_snn/best_backbone.pt"
 
 # =============================================================================

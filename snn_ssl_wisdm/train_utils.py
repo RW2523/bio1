@@ -67,6 +67,8 @@ def resolve_paths(cfg: Dict[str, Any], config_path: Path) -> Dict[str, Any]:
         cfg["processed_path"] = fix(cfg["processed_path"])
     if "splits_path" in cfg:
         cfg["splits_path"] = fix(cfg["splits_path"])
+    if "splits_window_path" in cfg:
+        cfg["splits_window_path"] = fix(cfg["splits_window_path"])
     if "output_root" in cfg:
         cfg["output_root"] = fix(cfg["output_root"])
     cfg["_config_path"] = str(config_path.resolve())

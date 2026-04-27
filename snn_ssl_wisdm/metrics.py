@@ -49,7 +49,11 @@ def compute_metrics(
                 "f1": float(report[key]["f1-score"]),
                 "support": int(report[key]["support"]),
             }
-    return {
+    per_class_recall = {
+        str(i): float(per_class[str(i)]["recall"]) if str(i) in per_class else 0.0 for i in labels
+    }
+
+    out = {
         "accuracy": acc,
         "balanced_accuracy": bacc,
         "macro_f1": macro_f1,
@@ -57,8 +61,10 @@ def compute_metrics(
         "cohen_kappa": kappa,
         "confusion_matrix": cm,
         "per_class": per_class,
+        "per_class_recall": per_class_recall,
         "classification_report": report,
     }
+    return out
 
 
 @torch.no_grad()

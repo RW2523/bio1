@@ -41,10 +41,10 @@ else
   echo "== Full: prepare (all subjects)"
   python -m snn_ssl_wisdm.scripts.prepare_wisdm \
     --config snn_ssl_wisdm/configs/default.yaml
-  # Match default.yaml: 150 / 150 / 300 (CLI --epochs overrides config)
-  EP_L=150
-  EP_P=300
-  EP_F=150
+  # Match default.yaml (~60 epochs each stage; override with --epochs)
+  EP_L=60
+  EP_P=60
+  EP_F=60
 fi
 
 # ── Case 1: random frozen backbone + linear head ────────────────────────────

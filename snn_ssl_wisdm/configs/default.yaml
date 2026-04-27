@@ -1,28 +1,37 @@
 seed: 42
 device: null
 dataset_root: wisdm-dataset
+# Legacy single-device path (only if data.fused_12ch: false)
 device_type: watch
 sensor: accel
 sample_rate: 20
 resample_rate: null
-window_seconds: 10
-stride_seconds: 5
+# 6.4 s @ 20 Hz = 128 samples; stride 3.2 s = 64 samples (50% overlap)
+window_seconds: 6.4
+stride_seconds: 3.2
 num_classes: 18
 batch_size: 128
 num_workers: 4
 
-# ── training ──────────────────────────────────────────────────────────────
-epochs_linear_probe: 150      # Cases 1 & 2 (frozen backbone + linear head)
-epochs_case3_mlp: 150         # Case 3 (frozen backbone + MLP head)
-epochs_pretrain: 300          # SimCLR contrastive pretrain
-patience: 22                  # default early-stop (overridden by probe.patience)
-patience_pretrain: 45        # SSL patience
-min_epochs_pretrain: 50      # never stop SSL before this many epochs
+# Primary protocol: subject-disjoint splits + per-channel z-score from subject-train windows only.
+# Secondary: random window split JSON + ``python ... --split window`` (optional norm_mode override).
+data:
+  fused_12ch: true
+  evaluation_split: subject   # subject | window (override with CLI --split)
+  norm_mode: null              # null = subject norm if evaluation_split=subject, else window norm
 
-lr_head: 4.0e-3               # Cases 1 & 2 linear head LR
-lr_case3_mlp: 4.0e-3          # Case 3 MLP head LR
-lr_pretrain: 5.0e-4          # legacy key; SimCLR uses lr_simclr
-lr_simclr: 5.0e-4           # SimCLR AdamW LR (projector + backbone)
+# ── training ──────────────────────────────────────────────────────────────
+epochs_linear_probe: 60
+epochs_case3_mlp: 60
+epochs_pretrain: 60
+patience: 18
+patience_pretrain: 18
+min_epochs_pretrain: 15
+
+lr_head: 1.0e-3
+lr_case3_mlp: 1.0e-3
+lr_pretrain: 1.0e-3
+lr_simclr: 1.0e-3
 weight_decay: 1.0e-4
 grad_clip: 1.0
 amp: true
@@ -32,66 +41,69 @@ max_windows: null
 epochs: null
 
 # ── paths ──────────────────────────────────────────────────────────────────
-processed_path: snn_ssl_wisdm/processed/wisdm_watch_accel_10s.pt
-splits_path: snn_ssl_wisdm/processed/splits_seed42.json
+processed_path: snn_ssl_wisdm/processed/wisdm_fused12_6p4s_raw.pt
+splits_path: snn_ssl_wisdm/processed/splits_subject_seed42.json
+splits_window_path: snn_ssl_wisdm/processed/splits_window_seed42.json
 
-# ── spiking neuron ─────────────────────────────────────────────────────────
+# ── spiking neuron (LIF: DC drive = decay_input false; soft reset = v_reset None in SpikingJelly) ──
 spiking:
-  timesteps: 4
-  beta: 0.5           # tau = 1/(1-beta) = 2 → SpikingJelly: v += x/tau
-  threshold: 0.5      # healthy firing on N(0,1) BN features
+  timesteps: 4              # 128 / 4 = 32 samples per chunk
+  beta: 0.5                 # tau = 1/(1-beta); tune with threshold for time-series behaviour
+  threshold: 0.5            # also try 1.0 in sweeps
   detach_reset: true
+  decay_input: false        # direct current / graded drive to membrane
+  soft_reset: true          # subtract threshold after spike (not hard reset to 0)
 
 # ── model ──────────────────────────────────────────────────────────────────
 model:
   base_channels: 64
   layers: [2, 2, 2, 2]
-  feature_dim: 512
-  in_channels: 3
+  feature_dim: 512          # must equal base_channels * 8 for this layout
+  in_channels: 12           # phone acc+gyro + watch acc+gyro (xyz each)
 
-# ── frozen probe training (all cases) ─────────────────────────────────────
+# ── frozen probe training ───────────────────────────────────────────────────
 probe:
   label_smoothing: 0.08
-  mixup_alpha: 0.28           # 0 disables MixUp
-  train_noise_std: 0.045      # additive Gaussian on normalised windows (train only)
-  tta_passes: 10              # test-time logit average (1 = off)
-  tta_noise_std: 0.018        # noise std for extra TTA views
-  min_epochs: 22              # early-stop guard
-  patience: 28                # early-stop patience (val balanced accuracy)
-  # Class weights in CE already reweight loss; uniform shuffle often generalises better.
+  mixup_alpha: 0.28
+  train_noise_std: 0.045
+  tta_passes: 10
+  tta_noise_std: 0.018
+  min_epochs: 12
+  patience: 18              # early-stop on val macro-F1 (primary) plateau
   use_weighted_sampler: false
-  cosine_eta_min_ratio: 0.04 # cosine tail floor (fraction of peak LR after warm-up)
+  cosine_eta_min_ratio: 0.04
+  use_adamw: false          # true = AdamW; false = Adam (per project defaults)
 
-# ── case3: frozen backbone + deeper MLP head ────────────────────────────────
+# ── case3: frozen backbone + MLP head ─────────────────────────────────────
 head:
   type: mlp
   hidden_dim: 512
   hidden_dim2: 256
   dropout: 0.18
 
-# ── output ─────────────────────────────────────────────────────────────────
 output_root: outputs
 
-# ── SimCLR contrastive SSL (replaces AugPred in the default pipeline) ───────
+# ── SimCLR ─────────────────────────────────────────────────────────────────
 simclr:
-  temperature: 0.15           # NT-Xent temperature (lower = sharper)
+  temperature: 0.15
   projector_hidden: 2048
   projector_out: 128
-  aug_noise_std: 0.085        # Gaussian noise (train views)
+  aug_noise_std: 0.085
   aug_scale_lo: 0.72
   aug_scale_hi: 1.32
   aug_reverse_prob: 0.5
   aug_time_warp_prob: 0.55
   aug_time_warp_strength: 0.22
   aug_channel_drop_prob: 0.12
-  val_noise_std: 0.012        # tiny noise for val views (two weak augmentations)
-  use_weighted_sampler: false # keep negative diversity for NT-Xent
+  val_noise_std: 0.012
+  use_weighted_sampler: false
   weight_decay_backbone: 1.0e-4
   weight_decay_projector: 1.0e-6
-  cosine_eta_min_ratio: 0.05  # cosine LR floor (fraction of base LR)
+  cosine_eta_min_ratio: 0.05
+  use_adamw: false
 
-# Optional: AugPred script ``pretrain_augpred_snn.py`` still reads ``augpred:`` if you switch back.
 augpred:
   num_perm_chunks: 4
   time_warp_strength: 0.22
   input_noise_std: 0.028
+  use_adamw: false

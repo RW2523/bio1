@@ -13,7 +13,12 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from snn_ssl_wisdm.data.splits import save_split_json, subject_split
+from snn_ssl_wisdm.data.splits import (
+    save_split_json,
+    save_window_split_json,
+    subject_split,
+    window_index_split,
+)
 from snn_ssl_wisdm.train_utils import load_yaml, merge_dict, resolve_paths, set_seed, workspace_root
 
 
@@ -139,6 +144,196 @@ def _discover_files(root: Path, device_type: str, sensor: str) -> List[Path]:
     return [Path(p) for p in files]
 
 
+def _discover_watch_accel_fused(root: Path) -> List[Tuple[int, Path]]:
+    pat = str(root / "raw" / "watch" / "accel" / "data_*_accel_watch.txt")
+    files = sorted(glob.glob(pat))
+    out: List[Tuple[int, Path]] = []
+    for p in files:
+        m = re.search(r"data_(\d+)_accel_watch", Path(p).name)
+        if m:
+            out.append((int(m.group(1)), Path(p)))
+    return out
+
+
+def _four_stream_paths(root: Path, sid: int) -> Dict[str, Path]:
+    return {
+        "watch_accel": root / "raw" / "watch" / "accel" / f"data_{sid}_accel_watch.txt",
+        "watch_gyro": root / "raw" / "watch" / "gyro" / f"data_{sid}_gyro_watch.txt",
+        "phone_accel": root / "raw" / "phone" / "accel" / f"data_{sid}_accel_phone.txt",
+        "phone_gyro": root / "raw" / "phone" / "gyro" / f"data_{sid}_gyro_phone.txt",
+    }
+
+
+def _interp_xyz_on_times(
+    stream: List[Tuple[int, str, float, np.ndarray]],
+    act: str,
+    times_master: np.ndarray,
+) -> Optional[np.ndarray]:
+    """Interpolate sensor xyz onto times_master; require >=2 samples overlapping segment."""
+    if len(times_master) == 0:
+        return None
+    t0 = float(times_master[0]) - 0.5
+    t1 = float(times_master[-1]) + 0.5
+    rows = [r for r in stream if r[1] == act and t0 <= r[2] <= t1]
+    if len(rows) < 2:
+        return None
+    ts = np.array([r[2] for r in rows], dtype=np.float64)
+    order = np.argsort(ts)
+    ts = ts[order]
+    xyz = np.stack([rows[i][3] for i in order], axis=0).astype(np.float64)
+    out = np.zeros((len(times_master), 3), dtype=np.float32)
+    tm = times_master.astype(np.float64)
+    for k in range(3):
+        out[:, k] = np.interp(tm, ts, xyz[:, k]).astype(np.float32)
+    return out
+
+
+def _fused_segments_to_windows(
+    watch_accel: List[Tuple[int, str, float, np.ndarray]],
+    watch_gyro: List[Tuple[int, str, float, np.ndarray]],
+    phone_accel: List[Tuple[int, str, float, np.ndarray]],
+    phone_gyro: List[Tuple[int, str, float, np.ndarray]],
+    subject_id: int,
+    window_len: int,
+    stride_len: int,
+) -> List[Dict[str, Any]]:
+    """Single-activity segments on watch accel timeline; [12,T] = phone_a, phone_g, watch_a, watch_g."""
+    out: List[Dict[str, Any]] = []
+    if not watch_accel:
+        return out
+    segs: List[List[Tuple[int, str, float, np.ndarray]]] = []
+    cur: List[Tuple[int, str, float, np.ndarray]] = []
+    last_act = None
+    for row in watch_accel:
+        act = row[1]
+        if last_act is not None and act != last_act:
+            segs.append(cur)
+            cur = []
+        cur.append(row)
+        last_act = act
+    if cur:
+        segs.append(cur)
+
+    for seg in segs:
+        if len(seg) < window_len:
+            continue
+        act = seg[0][1]
+        if act not in ACT_TO_IDX:
+            continue
+        label = ACT_TO_IDX[act]
+        ts_arr = np.array([r[2] for r in seg], dtype=np.float64)
+        wa = np.stack([r[3] for r in seg], axis=0).astype(np.float32)
+
+        pa = _interp_xyz_on_times(phone_accel, act, ts_arr)
+        pg = _interp_xyz_on_times(phone_gyro, act, ts_arr)
+        wg = _interp_xyz_on_times(watch_gyro, act, ts_arr)
+        if pa is None or pg is None or wg is None:
+            continue
+
+        fused = np.concatenate([pa, pg, wa, wg], axis=1)
+        assert fused.shape[1] == 12
+        L = fused.shape[0]
+        for start in range(0, L - window_len + 1, stride_len):
+            sl = slice(start, start + window_len)
+            w = fused[sl].T.copy()
+            out.append({"window": w.astype(np.float32), "label": label, "subject": subject_id})
+    return out
+
+
+def _prepare_fused_12ch(cfg: Dict[str, Any], root: Path, seed: int) -> Dict[str, Any]:
+    """Phone+watch accel+gyro aligned on watch timestamps; shape [N,12,128]."""
+    sample_rate = float(cfg["sample_rate"])
+    window_len = int(round(float(cfg["window_seconds"]) * sample_rate))
+    stride_len = int(round(float(cfg["stride_seconds"]) * sample_rate))
+    if window_len != 128:
+        print(f"[prepare] fused: window_len={window_len} (expected 128 for 6.4s@20Hz)")
+    if stride_len != 64:
+        print(f"[prepare] fused: stride_len={stride_len} (expected 64 for 50% overlap@20Hz)")
+
+    pairs = _discover_watch_accel_fused(root)
+    if not pairs:
+        raise FileNotFoundError(f"No watch accel files under {root}/raw/watch/accel/")
+    rng = random.Random(seed)
+    rng.shuffle(pairs)
+    lim = cfg.get("limit_subjects")
+    if lim is not None:
+        pairs = pairs[: int(lim)]
+
+    all_items: List[Dict[str, Any]] = []
+    skipped_subj = 0
+    for sid, wpath in pairs:
+        paths = _four_stream_paths(root, sid)
+        if not all(p.is_file() for p in paths.values()):
+            skipped_subj += 1
+            continue
+        wa = _read_stream(paths["watch_accel"])
+        wg = _read_stream(paths["watch_gyro"])
+        pa = _read_stream(paths["phone_accel"])
+        pg = _read_stream(paths["phone_gyro"])
+        wins = _fused_segments_to_windows(wa, wg, pa, pg, sid, window_len, stride_len)
+        all_items.extend(wins)
+
+    if skipped_subj:
+        print(f"[prepare] fused: skipped {skipped_subj} subjects (missing phone/watch streams)")
+    maxw = cfg.get("max_windows")
+    if maxw is not None and len(all_items) > int(maxw):
+        rng2 = random.Random(seed)
+        all_items = rng2.sample(all_items, int(maxw))
+
+    if not all_items:
+        raise RuntimeError(
+            "No fused windows — need raw/phone|watch/{accel,gyro}/data_{sid}_*_{phone|watch}.txt"
+        )
+
+    subjects = np.array([it["subject"] for it in all_items], dtype=np.int64)
+    labels = np.array([it["label"] for it in all_items], dtype=np.int64)
+    windows_raw = np.stack([it["window"] for it in all_items], axis=0)
+    w_t = torch.from_numpy(windows_raw).float()
+
+    split_sub = subject_split(subjects.tolist(), seed=seed)
+    tr_sub = np.isin(subjects, split_sub["train"])
+    if tr_sub.sum() == 0:
+        raise RuntimeError("Subject train split empty")
+
+    mean_s = w_t[tr_sub].mean(dim=(0, 2), keepdim=True)
+    std_s = w_t[tr_sub].std(dim=(0, 2), keepdim=True) + 1e-6
+
+    tr_wi, va_wi, te_wi = window_index_split(w_t.shape[0], seed=seed)
+    mean_w = w_t[tr_wi].mean(dim=(0, 2), keepdim=True)
+    std_w = w_t[tr_wi].std(dim=(0, 2), keepdim=True) + 1e-6
+
+    mags = torch.linalg.norm((w_t - mean_s) / std_s, dim=1)
+    weights = (mags.std(dim=1) + 1e-6).float()
+
+    window_sec = float(cfg["window_seconds"])
+    stride_sec = float(cfg["stride_seconds"])
+    bundle: Dict[str, Any] = {
+        "windows_raw": w_t,
+        "labels": torch.from_numpy(labels).long(),
+        "subjects": torch.from_numpy(subjects).long(),
+        "sample_weights": weights,
+        "norm_subject": {"mean": mean_s, "std": std_s},
+        "norm_window": {"mean": mean_w, "std": std_w},
+        "activity_to_idx": dict(ACT_TO_IDX),
+        "idx_to_activity": {v: k for k, v in ACT_TO_IDX.items()},
+        "meta": {
+            "fused_12ch": True,
+            "channel_order": ["phone_acc_xyz", "phone_gyro_xyz", "watch_acc_xyz", "watch_gyro_xyz"],
+            "window_seconds": window_sec,
+            "stride_seconds": stride_sec,
+            "sample_rate": sample_rate,
+            "window_length": window_len,
+            "stride_samples": stride_len,
+            "channels": 12,
+            "num_windows": int(w_t.shape[0]),
+            "seed": seed,
+            "single_activity_segments": True,
+            "alignment": "watch_accel_timeline_interp_phone_watch_gyro",
+        },
+    }
+    return {"bundle": bundle, "split_sub": split_sub, "tr_wi": tr_wi, "va_wi": va_wi, "te_wi": te_wi}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", type=str, default="snn_ssl_wisdm/configs/default.yaml")
@@ -161,6 +356,39 @@ def main():
     seed = int(cfg["seed"])
     set_seed(seed)
     root = Path(cfg["dataset_root"])
+    data_cfg = cfg.get("data") or {}
+    if bool(data_cfg.get("fused_12ch", False)):
+        res = _prepare_fused_12ch(cfg, root, seed)
+        bundle = res["bundle"]
+        out_pt = Path(cfg["processed_path"])
+        out_pt.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            torch.save(bundle, out_pt, _use_new_zipfile_serialization=True)
+        except TypeError:
+            torch.save(bundle, out_pt)
+        meta_split = {
+            "seed": seed,
+            "train_ratio": 0.7,
+            "val_ratio": 0.1,
+            "test_ratio": 0.2,
+            "processed_path": str(out_pt),
+            "split_type": "subject_disjoint",
+        }
+        save_split_json(Path(cfg["splits_path"]), res["split_sub"], meta_split)
+        wpath = Path(cfg.get("splits_window_path", "snn_ssl_wisdm/processed/splits_window_seed42.json"))
+        save_window_split_json(
+            wpath,
+            res["tr_wi"],
+            res["va_wi"],
+            res["te_wi"],
+            {"seed": seed, "processed_path": str(out_pt), "split_type": "random_window"},
+        )
+        shp = bundle["windows_raw"].shape
+        print(f"Saved fused 12ch (raw) → {out_pt} ({shp[0]} windows, C={shp[1]}, T={shp[2]})")
+        print(f"Subject splits → {cfg['splits_path']}")
+        print(f"Window splits  → {wpath}")
+        return
+
     device_type = cfg["device_type"]
     sensor = cfg["sensor"]
     sample_rate = float(cfg["sample_rate"])
